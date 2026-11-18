@@ -1,0 +1,2032 @@
+diff -ruN a/execution.py b/execution.py
+--- a/execution.py	2026-11-18 13:34:41.178333957 +0000
++++ b/execution.py	2026-11-18 13:34:41.179333962 +0000
+@@ -45,6 +45,16 @@
+ #   - check_all(): RECOVERY-позиции пропускаются без SL/TP-решений (SL/TP ещё
+ #     не заданы), monitoring_error для них не ставится.
+ #
++# ИЗМЕНЕНИЯ (партия P0 — точечное исправление дефектов первой поставки):
++#   Дефект №6: sync_recovery_quantity() хранит количество канонически
++#     ПОЛОЖИТЕЛЬНЫМ (лоты), независимо от знака брокерского значения
++#     (SHORT у брокера отрицателен). Знак, противоречащий направлению,
++#     НЕ синхронизируется (отдаётся оператору/reconcile); broker_lots=0
++#     НЕ закрывает RECOVERY автоматически.
++#     resolve_uncertain(): сравнение количества с брокером — по abs(lots)
++#     (знак уже проверен через направление) — SHORT больше не застревает
++#     в вечном UNCERTAIN из-за знака.
++#
+ # НЕ ИЗМЕНЕНО: PositionState (кроме добавления RECOVERY), get_position,
+ #   has_active_position, active_count, имена остальных полей TrackedPosition.
+ 
+@@ -294,21 +304,58 @@
+         Синхронизирует количество RECOVERY-позиции с ДОСТОВЕРНЫМ снимком брокера.
+         Вызывается только из reconcile при подтверждённом снимке (этап 5).
+         Направление не меняется. Возвращает True при изменении.
++
++        Дефект №6: количество хранится в ЕДИНОМ каноническом формате —
++        ПОЛОЖИТЕЛЬНОЕ число лотов, сторона — отдельно (pos.direction).
++        Знак брокерского значения (SHORT отрицателен) в pos.quantity
++        НЕ переносится; двойного применения знака нет ни в синхронизации,
++        ни в расчётах, ни при закрытии.
++        Правила:
++          - broker_lots == 0 — синхронизация НЕ выполняется, RECOVERY
++            НЕ закрывается автоматически (решение — оператор/reconcile);
++          - знак broker_lots противоречит направлению (LONG ожидает > 0,
++            SHORT ожидает < 0) — синхронизация НЕ выполняется,
++            расхождение отдаётся оператору;
++          - quantity/executed_lots/entry_applied_lots = abs(broker_lots).
+         """
+         if pos.state != PositionState.RECOVERY:
+             return False
+-        if broker_lots == pos.quantity:
++        try:
++            lots = int(broker_lots)
++        except (TypeError, ValueError):
++            logging.error(
++                f"[execution] sync_recovery {pos.ticker}: некорректное "
++                f"broker_lots={broker_lots!r} — синхронизация не выполнена"
++            )
++            return False
++        if lots == 0:
++            logging.error(
++                f"[execution] sync_recovery {pos.ticker}: broker_lots=0 — "
++                f"синхронизация не выполнена, автозакрытие RECOVERY запрещено "
++                f"(решение за оператором/reconcile)"
++            )
+             return False
++        expected_positive = (pos.direction == "BUY")  # BUY=LONG: у брокера > 0
++        if (lots > 0) != expected_positive:
++            logging.error(
++                f"[execution] sync_recovery {pos.ticker}: знак broker_lots={lots} "
++                f"противоречит направлению {pos.direction} — синхронизация не выполнена"
++            )
++            return False
++        abs_lots = abs(lots)
++        if abs_lots == pos.quantity:
++            return False
++        side_word = "SHORT" if lots < 0 else "LONG"
+         logging.info(
+-            f"[execution] sync_recovery {pos.ticker}: lots брокера={broker_lots}, "
+-            f"локально={pos.quantity} — синхронизировано"
++            f"[execution] sync_recovery {pos.ticker}: lots брокера={lots} "
++            f"({side_word}), локально={pos.quantity} — "
++            f"синхронизировано (каноническое количество {abs_lots})"
+         )
+-        pos.quantity = int(broker_lots)
+-        pos.executed_lots = int(abs(broker_lots))
+-        pos.entry_applied_lots = int(abs(broker_lots))
++        pos.quantity = abs_lots
++        pos.executed_lots = abs_lots
++        pos.entry_applied_lots = abs_lots
+         return True
+ 
+-
+     def get_position(self, figi: str) -> Optional[TrackedPosition]:
+         return self.positions.get(figi)
+ 
+@@ -539,8 +586,12 @@
+             pos.state = PositionState.UNCERTAIN
+             return
+ 
+-        # Сверка количества (лоты)
+-        if broker.lots != pos.quantity:
++        # Сверка количества (лоты).
++        # Дефект №6: направление уже сверено выше (брокер = наша сторона),
++        # поэтому сравниваем МОДУЛЬ количества: локально quantity хранится
++        # канонически положительным, у брокера SHORT отрицателен.
++        broker_lots_abs = abs(int(broker.lots))
++        if broker_lots_abs != pos.quantity:
+             logging.error(
+                 f"[execution] resolve_uncertain {pos.ticker}: lots брокера={broker.lots}, "
+                 f"локально={pos.quantity} — расхождение, остаётся UNCERTAIN"
+@@ -549,10 +600,11 @@
+             return
+ 
+         # Всё сходится
+-        pos.quantity = broker.lots
++        pos.quantity = broker_lots_abs
+         pos.state = PositionState.OPEN
+         logging.info(
+-            f"[execution] resolve_uncertain {pos.ticker}: сверка OK (lots={broker.lots}) → OPEN"
++            f"[execution] resolve_uncertain {pos.ticker}: сверка OK "
++            f"(lots={broker.lots}, qty={pos.quantity}) → OPEN"
+         )
+ 
+     @staticmethod
+diff -ruN a/main.py b/main.py
+--- a/main.py	2026-11-18 13:34:41.180333967 +0000
++++ b/main.py	2026-11-18 13:34:41.181333972 +0000
+@@ -132,13 +132,23 @@
+ 
+ 
+ def _age_in_cycles(rec) -> float:
+-    """Возраст записи реестра в циклах (для решения об отмене остатка)."""
++    """
++    Возраст записи реестра в циклах (для решения об отмене остатка).
++
++    Дефект №3: возраст считается от НЕИЗМЕНЯЕМОГО времени создания заявки
++    (created_at_utc — время записи INTENT), а не от timestamp_utc, который
++    record_status() обновляет при каждом опросе. Обновление статуса NEW
++    не сбрасывает возраст; после перезапуска возраст восстанавливается
++    из реестра (created_at_utc хранится в журнале).
++    """
+     try:
+-        t0 = datetime.fromisoformat(rec.get("timestamp_utc"))
++        t0_raw = rec.get("created_at_utc") or rec.get("timestamp_utc")
++        t0 = datetime.fromisoformat(t0_raw)
+         return (datetime.now(timezone.utc) - t0).total_seconds() / max(1, config.TRADING_CYCLE_SECONDS)
+     except Exception:
+         return 0.0
+ 
++
+ top_instruments = []
+ telegram_bot = None
+ main_client = None
+@@ -190,6 +200,8 @@
+     monitoring_err = "ДА" if (monitor_ref and monitor_ref.monitoring_error) else "нет"
+     open_orders = ledger_ref.open_count() if ledger_ref else 0
+     save_err = "ДА" if state_save_failed else "нет"
++    ledger_ok = ledger_ref.is_reliable() if ledger_ref else True
++    ledger_ok_text = "OK" if ledger_ok else "НЕДОСТОВЕРЕН — новые BUY запрещены"
+     recovery = ", ".join(
+         f"{p.ticker} ({p.recovery_source or '?'})"
+         for p in (monitor_ref.positions.values() if monitor_ref else [])
+@@ -204,6 +216,7 @@
+         f"Неопределённость: {uncertain}\n"
+         f"Ошибка мониторинга цен: {monitoring_err}\n"
+         f"Ошибка сохранения state: {save_err}\n"
++        f"Реестр заявок: {ledger_ok_text}\n"
+         f"Незавершённых заявок: {open_orders}\n"
+         f"RECOVERY: {recovery}\n"
+         f"Для новых входов ({len(top_instruments)}): {instruments}\n"
+@@ -902,33 +915,67 @@
+ 
+     pos = None
+     recovery_source = None
++    sl_price = None
++    tp_price = None
+     if exec_price is not None and exec_price > 0:
+         if df is not None:
+-            sl_price, tp_price = rm.calculate_sl_tp(exec_price, "BUY", df)
++            # Дефект №7: исключение rm.calculate_sl_tp() НЕ срывает регистрацию
++            # подтверждённого исполнения — позиция создаётся как RECOVERY
++            # (без фиктивной цены входа и без фиктивных SL/TP).
++            try:
++                sl_price, tp_price = rm.calculate_sl_tp(exec_price, "BUY", df)
++            except Exception as e:
++                logging.error(
++                    f"[register] {ticker}: ОШИБКА расчёта SL/TP: {type(e).__name__}: {e} — "
++                    f"исполнение {executed_lots} лот. регистрируется как RECOVERY "
++                    f"(без фиктивных цены/SL/TP, автозакрытие запрещено)"
++                )
++                research_logger.log_event("RECOVERY_SLTP_ERROR", {
++                    "figi": figi, "ticker": ticker, "order_id": order_id,
++                    "executed_lots": executed_lots, "partial": partial,
++                    "error": f"{type(e).__name__}: {e}",
++                })
++                sl_price, tp_price = None, None
+         else:
+             # Свечей нет (опрос/старт): SL/TP считаются только по стратегии на
+             # свечах — сначала RECOVERY, расчёт после загрузки свечей.
+             sl_price, tp_price = None, None
+         if sl_price is not None and tp_price is not None:
+-            pos = monitor.register(
+-                figi=figi, ticker=ticker, direction="BUY",
+-                entry_price=exec_price, quantity=executed_lots,
+-                sl_price=sl_price, tp_price=tp_price, lot_size=lot_size,
+-                trade_id=trade_id, signal_reason=reason,
+-                signal_time=signal_time, price_before_order=price_before_order,
+-                order_send_time=order_send_time,
+-                entry_requested_lots=requested_lots,
+-                entry_applied_lots=executed_lots,
+-                entry_order_id=order_id,
+-            )
+-            pos.execution_price = exec_price
+-            pos.executed_lots = executed_lots
+-            pos.partial = partial
+-            pos.entry_actual_commission = entry_commission
++            try:
++                pos = monitor.register(
++                    figi=figi, ticker=ticker, direction="BUY",
++                    entry_price=exec_price, quantity=executed_lots,
++                    sl_price=sl_price, tp_price=tp_price, lot_size=lot_size,
++                    trade_id=trade_id, signal_reason=reason,
++                    signal_time=signal_time, price_before_order=price_before_order,
++                    order_send_time=order_send_time,
++                    entry_requested_lots=requested_lots,
++                    entry_applied_lots=executed_lots,
++                    entry_order_id=order_id,
++                )
++                pos.execution_price = exec_price
++                pos.executed_lots = executed_lots
++                pos.partial = partial
++                pos.entry_actual_commission = entry_commission
++            except Exception as e:
++                # Дефект №7 (защита в глубину): даже сбой register() не должен
++                # терять подтверждённое исполнение — fallback в RECOVERY.
++                logging.error(
++                    f"[register] {ticker}: ОШИБКА register(): {type(e).__name__}: {e} — "
++                    f"исполнение {executed_lots} лот. регистрируется как RECOVERY"
++                )
++                research_logger.log_event("RECOVERY_REGISTER_ERROR", {
++                    "figi": figi, "ticker": ticker, "order_id": order_id,
++                    "executed_lots": executed_lots,
++                    "error": f"{type(e).__name__}: {e}",
++                })
++                pos = None
++                recovery_source = "register_error"
+         else:
+             recovery_source = "no_sl_tp"
+     else:
+         recovery_source = "no_price"
++
+     if pos is None:
+         pos = monitor.register_recovery(
+             figi=figi, ticker=ticker, direction="BUY",
+@@ -1006,13 +1053,21 @@
+ 
+     Правила разрешения:
+       - терминальный статус с исполнением -> регистрация через единую точку
+-        (RECOVERY при неполных данных);
++        (RECOVERY при неполных данных); для CANCELLED/EXPIRED с исполненными
++        лотами статус заявки сохраняется как CANCELLED/EXPIRED с частичным
++        исполнением (дефект №2: статус и факт исполнения учитываются
++        раздельно, в позицию идёт только реально исполненное количество);
++      - FILL с lots_executed=0 — противоречие: UNCERTAIN, НЕ терминальный
++        FILL, НЕ отказ (дефект №8);
+       - терминальный статус БЕЗ исполнения (достоверное подтверждение брокера)
+         -> заявка закрыта в реестре, BUY по FIGI разблокируется;
+       - статус недоступен/заявка не найдена -> НЕ отказ: заявка остаётся в
+         реестре (UNCERTAIN-логика), новые BUY по FIGI блокированы;
+-      - PARTIALLYFILL или NEW старше ORDER_POLL_MAX_AGE_CYCLES -> отмена
+-        остатка (однократно), далее подтверждение терминального статуса.
++      - PARTIALLYFILL или NEW старше ORDER_POLL_MAX_AGE_CYCLES -> сначала
++        регистрация подтверждённых лотов, затем отмена остатка (дефект №1);
++      - заявки с неизвестной стороной (side=None) опрашиваются: завершение
++        без исполнения разрешает блокировку; признаки исполнения при
++        неизвестной стороне остаются UNCERTAIN для оператора (дефект №4).
+     """
+     for rec in list(ledger.open_orders(side="BUY")):
+         order_id = rec["order_id"]
+@@ -1037,12 +1092,28 @@
+                                  reason="достоверный отказ без исполнения", source="poll")
+             continue
+ 
++        # Дефект №8: FILL без подтверждённых исполненных лотов — противоречие.
++        # НЕ терминальный FILL и НЕ отказ: заявка остаётся UNCERTAIN в реестре
++        # (блокирует BUY по FIGI), разрешается повторным запросом состояния.
++        if status == "FILL" and le <= 0:
++            logging.error(
++                f"[poll] {ticker}: FILL, но lots_executed={le} — противоречие, "
++                f"UNCERTAIN (заявка остаётся в реестре для повторного разрешения)"
++            )
++            client.uncertain_state = True
++            ledger.record_uncertain(order_id, figi=figi, ticker=ticker,
++                                    side="BUY", executed_lots=le,
++                                    reason="FILL противоречие: lots_executed=0 при опросе",
++                                    source="poll")
++            continue
++
+         if status == "FILL" or le > 0 or status == "PARTIALLYFILL":
+             info = await client.get_instrument_info(figi) if figi else None
+             lot = int(info.get("lot")) if info and info.get("lot") else 1
+             exec_price = ExecutionMonitor._extract_price(state, le, lot)
+             entry_commission = ExecutionMonitor._extract_commission(state)
+             partial_like = status in ("PARTIALLYFILL", "NEW") or (status is None and le > 0)
++            terminal_cancelled = status in ("CANCELLED", "EXPIRED")
+             if partial_like:
+                 # Живой остаток (частичное исполнение или активная NEW): отмена по возрасту
+                 already_cancel = "cancel_requested" in (rec.get("reason") or "")
+@@ -1053,6 +1124,22 @@
+                         f"[poll] {ticker}: заявка {order_id} жива "
+                         f"({le} лот., возраст {age:.0f} циклов, status={status}) — отмена остатка"
+                     )
++                    # Дефект №1 (принцип): подтверждённое исполнение регистрируется
++                    # ДО отмены остатка — отмена не должна потерять исполненные лоты.
++                    if le > 0:
++                        await register_executed_buy(
++                            client, monitor, rm, ledger,
++                            figi=figi, ticker=ticker, order_id=order_id,
++                            trade_id=rec.get("trade_id") or "",
++                            reason=rec.get("reason") or "",
++                            signal_time=rec.get("created_at_utc") or rec.get("timestamp_utc") or "",
++                            price_before_order=0.0,
++                            order_send_time=rec.get("timestamp_utc") or "",
++                            requested_lots=int(rec.get("requested_lots") or 0),
++                            executed_lots=le, exec_price=exec_price, lot_size=lot,
++                            entry_commission=entry_commission, partial=True, df=None,
++                            source="poll", ledger_status=status or "PARTIALLYFILL",
++                        )
+                     cancel_resp = await client.cancel_order(order_id)
+                     if cancel_resp is None:
+                         ledger.record_uncertain(order_id, figi=figi, ticker=ticker,
+@@ -1073,7 +1160,7 @@
+                     figi=figi, ticker=ticker, order_id=order_id,
+                     trade_id=rec.get("trade_id") or "",
+                     reason=rec.get("reason") or "",
+-                    signal_time=rec.get("timestamp_utc") or "",
++                    signal_time=rec.get("created_at_utc") or rec.get("timestamp_utc") or "",
+                     price_before_order=0.0,
+                     order_send_time=rec.get("timestamp_utc") or "",
+                     requested_lots=int(rec.get("requested_lots") or 0),
+@@ -1083,13 +1170,43 @@
+                 )
+                 continue
+ 
++            if terminal_cancelled:
++                # Дефект №2: CANCELLED/EXPIRED с исполненными лотами — это
++                # отменённая/истёкшая заявка С ЧАСТИЧНЫМ ИСПОЛНЕНИЕМ, а не
++                # «полное исполнение». Статус заявки и факт исполнения
++                # учитываются раздельно: в позицию регистрируется только
++                # реально исполненное количество (le), неисполненный остаток
++                # НЕ попадает в позицию; повторный опрос не дублирует позицию
++                # и не прибавляет уже учтённые лоты (идемпотентность
++                # register_executed_buy + sync для RECOVERY — покрывает и
++                # позднее исполнение после отмены).
++                logging.warning(
++                    f"[poll] {ticker}: заявка {order_id} {status} с частичным "
++                    f"исполнением {le} лот — регистрирую исполненную часть "
++                    f"(статус заявки сохраняется как {status})"
++                )
++                await register_executed_buy(
++                    client, monitor, rm, ledger,
++                    figi=figi, ticker=ticker, order_id=order_id,
++                    trade_id=rec.get("trade_id") or "",
++                    reason=rec.get("reason") or "",
++                    signal_time=rec.get("created_at_utc") or rec.get("timestamp_utc") or "",
++                    price_before_order=0.0,
++                    order_send_time=rec.get("timestamp_utc") or "",
++                    requested_lots=int(rec.get("requested_lots") or 0),
++                    executed_lots=le, exec_price=exec_price, lot_size=lot,
++                    entry_commission=entry_commission, partial=True, df=None,
++                    source="poll", ledger_status=status,
++                )
++                continue
++
+             # FILL: полная регистрация через единую точку
+             await register_executed_buy(
+                 client, monitor, rm, ledger,
+                 figi=figi, ticker=ticker, order_id=order_id,
+                 trade_id=rec.get("trade_id") or "",
+                 reason=rec.get("reason") or "",
+-                signal_time=rec.get("timestamp_utc") or "",
++                signal_time=rec.get("created_at_utc") or rec.get("timestamp_utc") or "",
+                 price_before_order=0.0,
+                 order_send_time=rec.get("timestamp_utc") or "",
+                 requested_lots=int(rec.get("requested_lots") or 0),
+@@ -1127,6 +1244,51 @@
+         ledger.record_status(order_id, "NEW" if status is None else status, executed_lots=le,
+                              reason=f"нестандартный статус {status!r}", source="poll")
+ 
++    # Дефект №4: заявки с НЕИЗВЕСТНОЙ стороной (side=None, например из
++    # стартовой сверки с брокером) тоже опрашиваются — иначе неопределённость
++    # не разрешится никогда. Позицию из такой заявки автоматически НЕ
++    # регистрируем (направление неизвестно); терминальное завершение БЕЗ
++    # исполнения — достоверное разрешение (блокировка снимается); признаки
++    # исполнения при неизвестной стороне остаются UNCERTAIN (решение — оператор).
++    for rec in list(ledger.open_orders()):
++        if rec.get("side") is not None:
++            continue
++        order_id = rec["order_id"]
++        figi = rec.get("figi") or ""
++        ticker = rec.get("ticker") or figi or "?"
++
++        state = await client.get_sandbox_order_state(order_id)
++        if state is None:
++            # статус недоступен — остаётся в неопределённости, блокировка сохраняется
++            continue
++
++        status = _status_name(getattr(state, "execution_report_status", None))
++        le = int(getattr(state, "lots_executed", 0) or 0)
++
++        if status in ("REJECTED", "CANCELLED", "EXPIRED") and le <= 0:
++            ledger.record_status(order_id, status, executed_lots=le,
++                                 reason="достоверное завершение без исполнения "
++                                        "(сторона неизвестна) — блокировка снята",
++                                 source="poll_unknown")
++            continue
++        if status == "FILL" or le > 0 or status == "PARTIALLYFILL":
++            logging.error(
++                f"[poll] {ticker}: заявка {order_id} с НЕИЗВЕСТНОЙ стороной имеет "
++                f"признаки исполнения (status={status}, lots_executed={le}) — "
++                f"остаётся UNCERTAIN, требуется разрешение оператором; "
++                f"BUY заблокированы, позиции продолжают мониториться"
++            )
++            client.uncertain_state = True
++            ledger.record_uncertain(order_id, figi=figi, ticker=ticker, side=None,
++                                    executed_lots=le,
++                                    reason="исполнение при неизвестной стороне — "
++                                           "авторегистрация запрещена, требуется оператор",
++                                    source="poll_unknown")
++            continue
++        ledger.record_status(order_id, status or "NEW", executed_lots=le,
++                             reason="активна (сторона неизвестна)", source="poll_unknown")
++
++
+ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMonitor, rm: RiskManager):
+     """
+     Восстановление цены входа для RECOVERY-позиций (этап 5).
+@@ -1221,9 +1383,26 @@
+     #    (сначала заявки — чтобы связать позицию с order_id через единую точку)
+     for rec in list(ledger.open_orders()):
+         oid = rec["order_id"]
+-        side = rec.get("side") or "BUY"
++        side = rec.get("side")
+         figi = rec.get("figi") or ""
+         ticker = rec.get("ticker") or figi or "?"
++
++        # Дефект №4: сторона неизвестна — автоматическая регистрация позиции
++        # как BUY ЗАПРЕЩЕНА (нельзя разрешать неопределённость «по умолчанию»
++        # в сторону покупки). Заявка остаётся UNCERTAIN: BUY по её FIGI (или
++        # глобально, если FIGI неизвестен) блокированы до разрешения.
++        if side is None:
++            ledger.record_uncertain(
++                oid, figi=figi, ticker=ticker, side=None,
++                requested_lots=int(rec.get("requested_lots") or 0),
++                executed_lots=int(rec.get("executed_lots") or 0),
++                reason="сторона заявки неизвестна — авторегистрация запрещена, "
++                       "требуется разрешение оператором",
++                source="startup",
++            )
++            summary["orders_uncertain"] += 1
++            continue
++
+         state = await client.get_sandbox_order_state(oid)
+         if state is None:
+             ledger.record_uncertain(
+@@ -1304,8 +1483,9 @@
+         if summary["unknown_broker_orders"]:
+             await notify(
+                 f"⚠️ При старте обнаружены заявки брокера без записи в реестре: "
+-                f"{summary['unknown_broker_orders']} — переведены в UNCERTAIN, "
+-                f"BUY по их FIGI заблокированы до разрешения."
++                f"{summary['unknown_broker_orders']} — переведены в UNCERTAIN. "
++                f"BUY по их FIGI заблокированы; заявки БЕЗ FIGI блокируют ВСЕ новые BUY "
++                f"глобально до разрешения. Позиции продолжают мониториться."
+             )
+ 
+     # 3. Позиции брокера (адопция того, что не зарегистрировано через заявки)
+@@ -1419,6 +1599,29 @@
+         logging.error("[cycle] state.json не сохранён ранее — новые входы запрещены до успешного сохранения.")
+         _save_state_checked(monitor, rm)
+         return
++    if ledger is not None and not ledger.is_reliable():
++        # Дефект №5: недостоверный реестр (повреждение/ошибка чтения журнала) —
++        # робот может «забыть» ранее созданные заявки. Новые BUY запрещены
++        # до восстановления целостности ЖУРНАЛОМ ОПЕРАТОРА (журнал не
++        # обрезается и не перезаписывается автоматически). Позиции
++        # продолжают мониториться (SL/TP и закрытия работают).
++        logging.error(
++            "[cycle] Реестр заявок НЕДОСТОВЕРЕН — новые BUY запрещены до "
++            f"восстановления целостности. Причина: {ledger.unreliable_reason}"
++        )
++        _save_state_checked(monitor, rm)
++        return
++    if ledger is not None and ledger.has_unknown_figi_open_orders():
++        # Дефект №4: незавершённая заявка без FIGI — неизвестно, какой
++        # инструмент она затрагивает. Новые BUY запрещены ГЛОБАЛЬНО до
++        # разрешения неопределённости. Существующие позиции мониторятся.
++        logging.error(
++            "[cycle] Незавершённая заявка БЕЗ FIGI в реестре — новые BUY "
++            "запрещены ГЛОБАЛЬНО до разрешения неопределённости."
++        )
++        _save_state_checked(monitor, rm)
++        return
++
+     # 6. Свежий портфель перед входами
+     positions = await client.get_positions()
+     if positions is None:
+@@ -1439,9 +1642,12 @@
+         if (pos_data is not None and pos_data.lots != 0) or monitor.has_active_position(figi):
+             logging.info(f"{inst['ticker']}: позиция уже открыта/в неопределённости, пропуск")
+             continue
+-        if ledger is not None and ledger.figi_has_open_order(figi, side="BUY"):
+-            # Этап 5: незавершённая/неопределённая BUY-заявка по FIGI блокирует новые входы
+-            logging.warning(f"{inst['ticker']}: в реестре есть незавершённая BUY-заявка — вход заблокирован")
++        if ledger is not None and ledger.figi_blocks_buy(figi):
++            # Дефект №4: вход блокирует ЛЮБАЯ незавершённая/неопределённая
++            # заявка по FIGI: незавершённая BUY, заявка с неизвестной стороной
++            # (side=None) и UNCERTAIN любой стороны. Нельзя разрешать BUY
++            # только потому, что сторона заявки неизвестна.
++            logging.warning(f"{inst['ticker']}: в реестре есть незавершённая/неопределённая заявка по FIGI — вход заблокирован")
+             continue
+ 
+         df = await _build_candles_df(client, figi)
+@@ -1584,21 +1790,76 @@
+ 
+             fresh_positions = await client.get_positions()
+             if fresh_positions is None:
+-                logging.error(f"{inst['ticker']}: fresh positions=None — UNCERTAIN; заявка остаётся в реестре")
++                # Снимок портфеля недостоверен. Но это НЕ отменяет подтверждённое
++                # брокером исполнение (Дефект №1): если final_state показывает
++                # исполненные лоты — регистрируем их; иначе заявка остаётся в
++                # реестре (неопределённость) под опросом.
++                fs_status_np = _status_name(getattr(final_state, "execution_report_status", None))
++                le_fs = int(getattr(final_state, "lots_executed", 0) or 0)
++                if le_fs > 0:
++                    logging.warning(
++                        f"{inst['ticker']}: снимок портфеля недоступен, но брокер подтвердил "
++                        f"{le_fs} исполненных лот — регистрация исполнения (Дефект №1)"
++                    )
++                    exec_price = ExecutionMonitor._extract_price(final_state, le_fs, info['lot'])
++                    await register_executed_buy(
++                        client, monitor, rm, ledger,
++                        figi=figi, ticker=inst['ticker'], order_id=order_id, trade_id=trade_id,
++                        reason=reason, signal_time=order_send_time,
++                        price_before_order=float(price), order_send_time=order_send_time,
++                        requested_lots=lots, executed_lots=le_fs, exec_price=exec_price,
++                        lot_size=info['lot'],
++                        entry_commission=ExecutionMonitor._extract_commission(final_state),
++                        partial=True, df=df,
++                        source="partial_branch_no_snapshot",
++                        ledger_status=fs_status_np or "PARTIALLYFILL",
++                    )
++                else:
++                    logging.error(
++                        f"{inst['ticker']}: fresh positions=None, исполнение не подтверждено — "
++                        f"заявка остаётся в реестре (неопределённость)"
++                    )
+                 _save_state_checked(monitor, rm)
+                 continue
+ 
+             pos_data = fresh_positions.get(figi)
+             if pos_data is None or pos_data.lots == 0:
+                 le_after = int(getattr(final_state, "lots_executed", 0) or 0)
+-                logging.warning(f"{inst['ticker']}: после отмены позиции нет — OK")
+-                if ledger is not None:
+-                    ledger.record_status(order_id, "CANCELLED", executed_lots=le_after,
+-                                         reason="остаток отменён; исполнение не подтвердилось" if le_after == 0
+-                                         else "остаток отменён (позиция не обнаружена при проверке)",
+-                                         source="partial_branch")
++                if le_after <= 0:
++                    logging.warning(f"{inst['ticker']}: после отмены позиции нет, исполнение не подтверждено брокером — заявка закрыта в реестре")
++                    if ledger is not None:
++                        ledger.record_status(order_id, "CANCELLED", executed_lots=0,
++                                             reason="остаток отменён; достоверный отказ без исполнения",
++                                             source="partial_branch")
++                    _save_state_checked(monitor, rm)
++                    continue
++                # Дефект №1: брокер подтвердил исполненные лоты, но свежий снимок
++                # портфеля позицию пока НЕ показывает (задержка маппинга сделок).
++                # Отсутствие позиции в снимке НЕ отменяет подтверждённое
++                # исполнение: регистрируем ровно исполненное количество; при
++                # недоступной цене — RECOVERY. Статус заявки в реестре —
++                # фактический статус брокера (частичное исполнение отменённой
++                # заявки, Дефект №2), а не «исполнение не подтвердилось».
++                fs_status = _status_name(getattr(final_state, "execution_report_status", None))
++                logging.warning(
++                    f"{inst['ticker']}: остаток отменён, портфель пока не показывает позицию, "
++                    f"но брокер подтвердил {le_after} исполненных лот — регистрация (Дефект №1)"
++                )
++                exec_price = ExecutionMonitor._extract_price(final_state, le_after, info['lot'])
++                await register_executed_buy(
++                    client, monitor, rm, ledger,
++                    figi=figi, ticker=inst['ticker'], order_id=order_id, trade_id=trade_id,
++                    reason=reason, signal_time=order_send_time,
++                    price_before_order=float(price), order_send_time=order_send_time,
++                    requested_lots=lots, executed_lots=le_after, exec_price=exec_price,
++                    lot_size=info['lot'],
++                    entry_commission=ExecutionMonitor._extract_commission(final_state),
++                    partial=True, df=df, source="partial_branch_confirmed",
++                    ledger_status=fs_status or "PARTIALLYFILL",
++                )
+                 _save_state_checked(monitor, rm)
+                 continue
++
+             le = pos_data.lots
+             exec_price = ExecutionMonitor._extract_price(final_state, le, info['lot'])
+ 
+@@ -1783,6 +2044,24 @@
+         ledger.load()
+         ledger_ref = ledger
+ 
++        # Дефект №5: недостоверный реестр (повреждение/ошибка чтения журнала).
++        # Новые BUY запрещены до восстановления целостности оператором;
++        # существующие позиции продолжают мониториться.
++        if not ledger.is_reliable():
++            _msg = (
++                "⛔ Реестр заявок НЕДОСТОВЕРЕН (повреждение/ошибка чтения "
++                f"{LEDGER_FILE}).\nНовые BUY ЗАПРЕЩЕНЫ до восстановления "
++                f"целостности журнала.\nЖурнал не обрезался и не перезаписывался "
++                f"(автовосстановление отключено — восстановление вручную).\n"
++                f"Причина: {ledger.unreliable_reason}\n"
++                f"Позиции продолжают мониториться."
++            )
++            logging.error(f"[main] {_msg}")
++            research_logger.log_event("LEDGER_UNRELIABLE", {
++                "reason": ledger.unreliable_reason, "file": LEDGER_FILE,
++            })
++            await notify(_msg)
++
+         state_loaded = _load_state(monitor, rm)
+         if not state_loaded:
+             client.uncertain_state = True
+diff -ruN a/order_ledger.py b/order_ledger.py
+--- a/order_ledger.py	2026-11-18 13:34:41.176333947 +0000
++++ b/order_ledger.py	2026-11-18 13:34:41.177333952 +0000
+@@ -35,8 +35,27 @@
+ #   локально и принимается брокером, контракт SDK 1.51.0 подтверждён аудитом).
+ #   Дополнительные идентификаторы не вводятся.
+ #
+-# ЦЕЛОСТНОСТЬ: append + flush + fsync. Повреждённая хвостовая строка
+-#   (обрыв записи при сбое) обрезается при load() с журналированием.
++# ЦЕЛОСТНОСТЬ: append + flush + fsync.
++#
++# ИЗМЕНЕНИЯ (партия P0 — точечное исправление дефектов первой поставки):
++#   Дефект №3: у записи реестра разделены immutable created_at_utc (время
++#     создания INTENT — источник возраста заявки) и updated_at_utc (время
++#     последнего перехода). Обновление статуса NEW больше НЕ сбрасывает возраст.
++#     Возраст восстанавливается после перезапуска из журнала.
++#   Дефект №5: повреждение журнала (ошибка чтения, повреждённая строка в
++#     середине или хвосте) переводит реестр в ЯВНОЕ состояние недостоверности
++#     (is_reliable() == False). Повреждённая строка не пропускается молча;
++#     исходный журнал НЕ обрезается и НЕ перезаписывается; автоматическое
++#     восстановление не выполняется. main.py запрещает новые BUY до
++#     восстановления целостности (позиции продолжают мониториться).
++#   Дефект №8: record_sent() не фиксирует терминальный FILL без проверенного
++#     executed_lots > 0: противоречие записывается как UNCERTAIN (заявка
++#     остаётся в open_orders, блокирует BUY, разрешается повторным запросом).
++#   Дефект №4: figi_blocks_buy() — блокировка новых BUY по FIGI ЛЮБОЙ
++#     незавершённой/неопределённой заявкой (BUY, side=None, UNCERTAIN);
++#     has_unknown_figi_open_orders() — глобальная блокировка BUY при заявке
++#     без FIGI.
++
+ import json
+ import logging
+ import os
+@@ -64,8 +83,12 @@
+     "timestamp_utc", "status", "order_id", "trade_id", "figi", "ticker",
+     "side", "requested_lots", "executed_lots", "lots_left",
+     "avg_exec_price", "reason", "source", "error",
++    # Дефект №3: immutable время создания заявки (INTENT) и время последнего
++    # перехода. created_at_utc НЕ обновляется при изменении статуса.
++    "created_at_utc", "updated_at_utc",
+ ]
+ 
++
+ def utc_now_iso() -> str:
+     return datetime.now(timezone.utc).isoformat()
+ 
+@@ -85,73 +108,125 @@
+         # order_id -> последний переход (агрегированное состояние)
+         self._latest: Dict[str, dict] = {}
+         self._corrupt_tail_truncated = False
++        # Дефект №5: реестр достоверен, пока не доказано обратное.
++        # Повреждение журнала или ошибка чтения делают его НЕдостоверным:
++        # main.py запрещает новые BUY до восстановления целостности.
++        self._reliable = True
++        self._unreliable_reason = ""
+ 
+     # ------------------------------------------------------------------
+     # Загрузка / целостность
+     # ------------------------------------------------------------------
+ 
++    def is_reliable(self) -> bool:
++        """Дефект №5: False — журнал повреждён/нечитаем; новые BUY запрещены."""
++        return self._reliable
++
++    @property
++    def unreliable_reason(self) -> str:
++        return self._unreliable_reason
++
++    def _mark_unreliable(self, reason: str) -> None:
++        # Идемпотентно: первая причина сохраняется для диагностики.
++        if not self._reliable:
++            return
++        self._reliable = False
++        self._unreliable_reason = reason
++        logging.error(
++            f"[ledger] РЕЕСТР НЕДОСТОВЕРЕН: {reason}. Новые BUY запрещены "
++            f"до восстановления целостности журнала (позиции продолжают "
++            f"мониториться). Автоматическое восстановление не выполняется: "
++            f"журнал не обрезается и не перезаписывается — вмешательство оператора."
++        )
++
+     def load(self) -> None:
+-        """Восстанавливает индекс из JSONL. Повреждённый хвост обрезается."""
++        """
++        Восстанавливает индекс из JSONL.
++
++        Дефект №5: любое повреждение журнала (ошибка чтения, некорректная
++        строка в середине или в хвосте) переводит реестр в явно
++        недостоверное состояние (is_reliable() == False). Повреждённая
++        строка не пропускается молча; исходный журнал НЕ обрезается и
++        НЕ перезаписывается; автоматическое восстановление не выполняется
++        (оно может потерять историю заявок). Читаемая часть загружается
++        по максимуму (best effort) — для сверки с брокером, но торговые
++        входы блокируются main.py до восстановления целостности.
++        Отсутствие файла — валидный пустой реестр (заявок не было).
++        """
+         self._latest = {}
+         self._corrupt_tail_truncated = False
++        self._reliable = True
++        self._unreliable_reason = ""
+         if not os.path.isfile(self.path):
+             logging.info(f"[ledger] {self.path} отсутствует — начинаю с пустого реестра.")
+             return
+ 
+-        good_bytes = 0
+         records = 0
+         try:
+             with open(self.path, "rb") as f:
+                 raw = f.read()
+         except Exception as e:
+-            logging.error(f"[ledger] Не удалось прочитать {self.path}: {type(e).__name__}: {e}")
++            # Дефект №5: ошибка чтения — реестр недостоверен (НЕ пустой достоверный).
++            self._mark_unreliable(
++                f"ошибка чтения {self.path}: {type(e).__name__}: {e}"
++            )
+             return
+ 
+-        offset = 0
+         lines = raw.splitlines(keepends=True)
+         for line in lines:
+             line_stripped = line.strip()
+             if not line_stripped:
+-                offset += len(line)
+                 continue
++            rec = None
+             try:
+                 rec = json.loads(line_stripped.decode("utf-8"))
+                 if not isinstance(rec, dict) or "status" not in rec or "order_id" not in rec:
+                     raise ValueError("неверная структура записи")
+             except Exception as e:
+-                # Повреждённая строка допустима ТОЛЬКО как хвост (обрыв append).
+-                if line is lines[-1]:
+-                    logging.error(
+-                        f"[ledger] Повреждена хвостовая строка {self.path} "
+-                        f"({type(e).__name__}) — обрезаю хвост, предыдущие записи сохранены."
+-                    )
+-                    self._corrupt_tail_truncated = True
+-                    break
+-                logging.error(f"[ledger] Повреждена строка в середине {self.path} — пропущена.")
+-                offset += len(line)
++                # Дефект №5: повреждённая строка (в хвосте при обрыве append
++                # или в середине) НЕ игнорируется молча и НЕ обрезается —
++                # реестр помечается недостоверным, торговля входами запрещена.
++                is_tail = line is lines[-1]
++                place = "хвост" if is_tail else "середина"
++                logging.error(
++                    f"[ledger] Повреждённая строка в {self.path} "
++                    f"({place}, {type(e).__name__}: {e}) — реестр недостоверен"
++                )
++                self._corrupt_tail_truncated = self._corrupt_tail_truncated or is_tail
++                self._mark_unreliable(
++                    f"повреждённая строка журнала ({place}): "
++                    f"{type(e).__name__}: {e}"
++                )
+                 continue
+-            self._latest[str(rec["order_id"])] = self._normalize(rec)
++            oid = str(rec["order_id"])
++            norm = self._normalize(rec)
++            prev = self._latest.get(oid)
++            if prev is not None and prev.get("created_at_utc"):
++                # Дефект №3: created_at_utc неизменяемо — берём самое раннее
++                # (первая запись заявки в журнале — обычно INTENT).
++                norm["created_at_utc"] = prev["created_at_utc"]
++            self._latest[oid] = norm
+             records += 1
+-            offset += len(line)
+ 
+-        if self._corrupt_tail_truncated and offset < len(raw):
+-            try:
+-                with open(self.path, "r+b") as f:
+-                    f.truncate(offset)
+-                    f.flush()
+-                    os.fsync(f.fileno())
+-                logging.info("[ledger] Хвост файла обрезан до последней целой записи.")
+-            except Exception as e:
+-                logging.error(f"[ledger] Не удалось обрезать хвост {self.path}: {type(e).__name__}: {e}")
+-
+-        logging.info(f"[ledger] Загружено переходов: {records}, заявок: {len(self._latest)}.")
++        logging.info(
++            f"[ledger] Загружено переходов: {records}, заявок: {len(self._latest)}"
++            + ("" if self._reliable else "; РЕЕСТР НЕДОСТОВЕРЕН — новые BUY запрещены")
++            + "."
++        )
+ 
+     @staticmethod
+     def _normalize(rec: dict) -> dict:
+         out = {k: rec.get(k) for k in RECORD_FIELDS}
+         out["order_id"] = str(rec.get("order_id"))
+         out["status"] = str(rec.get("status"))
++        # Дефект №3: created_at_utc — immutable время создания заявки.
++        # Для записей старого формата (без created_at_utc) берём timestamp_utc
++        # самой первой записи заявки (load() сохраняет самое раннее значение).
++        ts = rec.get("timestamp_utc")
++        out["created_at_utc"] = rec.get("created_at_utc") or ts
++        out["updated_at_utc"] = rec.get("updated_at_utc") or ts
+         return out
++
+     # ------------------------------------------------------------------
+     # Запись
+     # ------------------------------------------------------------------
+@@ -186,6 +261,13 @@
+             for k in ("trade_id", "figi", "ticker", "side", "requested_lots"):
+                 if record[k] is None:
+                     record[k] = prev.get(k)
++        # Дефект №3: created_at_utc неизменяем (наследуется от первого перехода
++        # заявки), updated_at_utc — время текущего перехода.
++        if prev is not None and prev.get("created_at_utc"):
++            record["created_at_utc"] = prev["created_at_utc"]
++        else:
++            record["created_at_utc"] = record["timestamp_utc"]
++        record["updated_at_utc"] = record["timestamp_utc"]
+         line = json.dumps(record, ensure_ascii=False)
+         try:
+             with open(self.path, "a", encoding="utf-8") as f:
+@@ -214,8 +296,36 @@
+                     executed_lots: int = None, avg_exec_price: float = None,
+                     status_hint: str = None, reason: str = "", source: str = "post_response",
+                     error: str = None) -> bool:
+-        """SENT сразу после ответа post_sandbox_order."""
++        """
++        SENT сразу после ответа post_sandbox_order.
++
++        Дефект №8: FILL не считается окончательно подтверждённым без
++        проверенного executed_lots > 0. Если ответ брокера содержит FILL,
++        а количество исполненных лотов отсутствует или равно нулю — статус
++        и количество противоречат друг другу: заявка записывается как
++        UNCERTAIN (НЕ терминальный FILL и НЕ отказ): остаётся в
++        open_orders(), блокирует новые BUY по FIGI и разрешается повторным
++        запросом состояния у брокера после восстановления связи.
++        """
+         status = STATUS_SENT if status_hint is None else status_hint
++        if status == STATUS_FILL:
++            try:
++                le_confirmed = executed_lots is not None and int(executed_lots) > 0
++            except (TypeError, ValueError):
++                le_confirmed = False
++            if not le_confirmed:
++                logging.error(
++                    f"[ledger] FILL противоречие: executed_lots={executed_lots!r} — "
++                    f"UNCERTAIN вместо терминального FILL (order_id={order_id})"
++                )
++                return self.append(
++                    STATUS_UNCERTAIN, order_id, trade_id=trade_id, figi=figi,
++                    ticker=ticker, side=side, requested_lots=requested_lots,
++                    executed_lots=executed_lots,
++                    reason="FILL противоречие: executed_lots не подтверждён (>0) — "
++                           "требуется повторный запрос состояния у брокера",
++                    source=source, error=error,
++                )
+         return self.append(status, order_id, trade_id=trade_id, figi=figi, ticker=ticker,
+                            side=side, requested_lots=requested_lots,
+                            executed_lots=executed_lots, avg_exec_price=avg_exec_price,
+@@ -266,13 +376,46 @@
+         return result
+ 
+     def figi_has_open_order(self, figi: str, side: str = "BUY") -> bool:
+-        """Есть ли незавершённая заявка по FIGI (блокировка новых BUY)."""
++        """Есть ли незавершённая заявка по FIGI строго данной стороны."""
+         for rec in self._latest.values():
+             if (rec.get("figi") == figi and rec.get("side") == side
+                     and rec["status"] in NON_TERMINAL_STATUSES):
+                 return True
+         return False
+ 
++    def figi_blocks_buy(self, figi: str) -> bool:
++        """
++        Дефект №4: блокирует ли что-то новые BUY по данному FIGI.
++
++        Блокируют ЛЮБЫЕ незавершённые заявки по FIGI:
++          - незавершённая BUY (прежнее правило);
++          - заявка с НЕИЗВЕСТНОЙ стороной (side=None): нельзя разрешать BUY
++            только потому, что сторона заявки неизвестна;
++          - UNCERTAIN любой стороны (направление/факт исполнения неизвестны).
++        Терминальные заявки без исполнения блокировку снимают.
++        """
++        for rec in self._latest.values():
++            if rec["status"] not in NON_TERMINAL_STATUSES:
++                continue
++            if rec.get("figi") != figi:
++                continue
++            if rec.get("side") == "BUY" or rec.get("side") is None:
++                return True
++            if rec["status"] == STATUS_UNCERTAIN:
++                return True
++        return False
++
++    def has_unknown_figi_open_orders(self) -> bool:
++        """
++        Дефект №4: есть ли незавершённая заявка, у которой не определён FIGI.
++        Такая заявка может затрагивать любой инструмент — до разрешения
++        неопределённости новые BUY запрещены ГЛОБАЛЬНО (main.py).
++        """
++        for rec in self._latest.values():
++            if rec["status"] in NON_TERMINAL_STATUSES and not rec.get("figi"):
++                return True
++        return False
++
+     def figi_is_uncertain(self, figi: str, side: str = "BUY") -> bool:
+         for rec in self._latest.values():
+             if (rec.get("figi") == figi and rec.get("side") == side
+diff -ruN a/tests/test_main_helpers.py b/tests/test_main_helpers.py
+--- a/tests/test_main_helpers.py	2026-11-18 13:34:41.183333982 +0000
++++ b/tests/test_main_helpers.py	2026-11-18 13:34:41.184333987 +0000
+@@ -29,6 +29,11 @@
+     async def get_sandbox_order_state(self, order_id):
+         return self.order_states.get(order_id)
+ 
++    async def get_instrument_info(self, figi):
++        # Этап 5 (адопция RECOVERY в reconcile): метод требуется путю адопции
++        return {"lot": 1, "ticker": figi, "name": figi, "min_price_increment": 0.1,
++                "instrument_type": "share"}
++
+     def is_uncertain(self):
+         return self.uncertain_state
+ 
+@@ -88,12 +93,24 @@
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_reconcile_unknown_position_sets_uncertain(monkeypatch):
++async def test_reconcile_unknown_position_adopted_as_recovery(monkeypatch, tmp_path):
++    """Обновлён (пояснение в шапке скрипта/диффа): по согласованному поведению
++    позиция брокера без локального учёта адоптируется в RECOVERY через
++    единую точку регистрации, а не вечно остаётся MISMATCH/UNCERTAIN."""
+     client = FakeClient(positions={"BBG004730N88": make_position(1)})
+     mon = ExecutionMonitor(client)
++    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
++    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+     await main.reconcile(client, mon)
+-    assert client.uncertain_state is True
+-    assert main.reconcile_done is False
++    # Адопция: позиция зарегистрирована и управляема (RECOVERY)
++    pos = mon.get_position("BBG004730N88")
++    assert pos is not None
++    assert pos.state == PositionState.RECOVERY
++    assert pos.quantity == 1
++    assert pos.direction == "BUY"
++    # Направление/количество совпадают — свека завершена
++    assert client.uncertain_state is False
++    assert main.reconcile_done is True
+ 
+ 
+ @pytest.mark.asyncio
+@@ -107,14 +124,23 @@
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_reconcile_closed_but_present_is_unknown(monkeypatch):
++async def test_reconcile_closed_but_present_adopted_as_recovery(monkeypatch, tmp_path):
++    """Обновлён (пояснение в шапке скрипта/диффа): CLOSED-запись не является
++    активным учётом; присутствующая у брокера позиция адоптируется в RECOVERY."""
+     client = FakeClient(positions={"FIGI": make_position(1)})
+     mon = ExecutionMonitor(client)
+     pos = register_buy(mon)
+     pos.state = PositionState.CLOSED
++    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
++    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+     await main.reconcile(client, mon)
+-    assert client.uncertain_state is True
+-    assert main.reconcile_done is False
++    adopted = mon.get_position("FIGI")
++    assert adopted is not None
++    assert adopted.state == PositionState.RECOVERY
++    assert adopted.quantity == 1
++    assert client.uncertain_state is False
++    assert main.reconcile_done is True
++
+ 
+ @pytest.mark.asyncio
+ async def test_reconcile_does_not_duplicate_local(monkeypatch):
+diff -ruN a/tests/test_p0_defect_fixes.py b/tests/test_p0_defect_fixes.py
+--- a/tests/test_p0_defect_fixes.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_p0_defect_fixes.py	2026-11-18 13:34:41.203334081 +0000
+@@ -0,0 +1,953 @@
++# tests/test_p0_defect_fixes.py
++# Tsclp_v2.2_volatile — тесты точечного исправления дефектов первой поставки P0.
++#
++# Соответствие дефект ↔ сценарий (обязательный набор из постановки):
++#   Дефект №1 (потеря частичного исполнения после отмены остатка):
++#       сценарий 1  — test_scenario_1_partial_buy_cancelled_portfolio_silent
++#       (плюс принцип в poll: test_scenario_4_*, test_poll_registers_before_cancel)
++#   Дефект №2 (неверный статус частичного исполнения):
++#       сценарий 2  — test_scenario_2_cancelled_with_executed_lots
++#       сценарий 3  — test_scenario_3_expired_with_executed_lots
++#       сценарий 4  — test_scenario_4_repeated_poll_no_quantity_doubling
++#       сценарий 5  — test_scenario_5_late_execution_after_cancel
++#   Дефект №3 (сброс возраста заявки):
++#       сценарий 6  — test_scenario_6_new_order_regularly_polled_reaches_timeout
++#       сценарий 7  — test_scenario_7_age_restored_after_restart
++#   Дефект №4 (неизвестная заявка не блокирует BUY):
++#       сценарий 8  — test_scenario_8_unknown_side_order_blocks_buy_by_figi
++#       сценарий 9  — test_scenario_9_unknown_figi_order_blocks_buy_globally
++#   Дефект №5 (повреждение реестра -> пустой достоверный реестр):
++#       сценарий 10 — test_scenario_10_corrupted_ledger_blocks_buy
++#       сценарий 11 — test_scenario_11_ledger_read_error_blocks_buy
++#   Дефект №6 (знак количества SHORT в RECOVERY):
++#       сценарий 12 — test_scenario_12_short_recovery_quantity_canonical
++#   Дефект №7 (исключение calculate_sl_tp срывает регистрацию FILL):
++#       сценарий 13 — test_scenario_13_sltp_exception_still_registers_recovery
++#   Дефект №8 (противоречивый FILL с нулём лотов):
++#       сценарий 14 — test_scenario_14_fill_with_zero_lots_not_confirmed
++#       сценарий 15 — test_scenario_15_repeated_recovery_same_order_id_no_duplicate
++#       сценарий 16 — test_scenario_16_registered_partial_not_added_again
++#
++# Тесты проверяют ПОСЛЕДСТВИЯ, а не только внутренние статусы: появилась ли
++# позиция, корректно ли количество, заблокирован ли BUY, осталась ли заявка
++# доступной для разрешения, есть ли дубликаты, не закрыта ли RECOVERY
++# автоматически.
++
++import builtins
++import json
++import os
++from datetime import datetime, timedelta, timezone
++from decimal import Decimal
++from types import SimpleNamespace
++
++import pytest
++
++import main
++import logger as research_logger
++import config
++from order_ledger import OrderLedger
++from execution import ExecutionMonitor, PositionState
++from tinkoff_client import PositionData
++
++FIGI = "BBG00TESTF0"
++TICKER = "TEST"
++OTHER_FIGI = "BBG00OTHERF1"
++
++
++# ============================================================
++# Фейки (mock, без реального API; SANDBOX-клиент не используется)
++# ============================================================
++
++class _Q:
++    def __init__(self, units=0, nano=0):
++        self.units = units
++        self.nano = nano
++
++
++def fake_state(status_code, lots_executed=0, price_units=0, price_nano=0, commission_units=0):
++    """Объект OrderState/PostOrderResponse-подобный (поля как в реальном SDK:
++    execution_report_status int, lots_executed int, MoneyValue units/nano)."""
++    st = SimpleNamespace(
++        execution_report_status=status_code,
++        lots_executed=lots_executed,
++        executed_order_price=_Q(price_units, price_nano),
++        executed_commission=_Q(commission_units, 0) if commission_units else None,
++    )
++    return st
++
++
++# Коды статусов (маппинг T-Invest, проверен по реальному SDK):
++FILL, REJECTED, CANCELLED, NEW, PARTIALLYFILL, EXPIRED = 1, 2, 3, 4, 5, 6
++
++
++class FakeClient:
++    def __init__(self, positions=None):
++        self.uncertain_state = False
++        self.order_states = {}            # order_id -> состояние заявки
++        self.positions_value = positions  # dict | None (None = снимок недоступен)
++        self.positions_after_first = None # опционально: снимок при ПОВТОРНЫХ вызовах
++        self.positions_calls = 0
++        self.prices_value = {}
++        self.orders_list = []             # активные заявки брокера (startup)
++        self.post_state = None            # ответ post_sandbox_order
++        self.final_state = None           # состояние заявки после отправки
++        self.post_error = None
++        self.cancel_response = object()   # не None — отмена подтверждена
++        self.last_post = None
++        self.cancel_calls = []
++        self.instrument_info = {
++            "lot": 1, "ticker": TICKER, "name": TICKER,
++            "min_price_increment": 0.1, "instrument_type": "share",
++        }
++
++    async def get_positions(self):
++        self.positions_calls += 1
++        if self.positions_after_first is not None and self.positions_calls > 1:
++            return self.positions_after_first
++        return self.positions_value
++
++    async def get_sandbox_order_state(self, order_id):
++        return self.order_states.get(order_id)
++
++    async def get_instrument_info(self, figi):
++        return dict(self.instrument_info)
++
++    async def get_last_prices(self, figi_list):
++        return dict(self.prices_value)
++
++    async def get_sandbox_orders(self):
++        return list(self.orders_list)
++
++    async def cancel_order(self, order_id):
++        self.cancel_calls.append(order_id)
++        return self.cancel_response
++
++    async def post_market_order(self, figi, quantity, direction, order_id=None):
++        self.last_post = {
++            "figi": figi, "quantity": quantity,
++            "direction": str(direction), "order_id": order_id,
++        }
++        if self.final_state is not None and order_id:
++            self.order_states[order_id] = self.final_state
++        return SimpleNamespace(order_id=order_id, state=self.post_state, error=self.post_error)
++
++    def is_uncertain(self):
++        return self.uncertain_state
++
++
++class FakeRM:
++    def __init__(self, sl=95.0, tp=110.0, size=5, raise_sltp=False):
++        self.sl = sl
++        self.tp = tp
++        self.size = size
++        self.raise_sltp = raise_sltp
++        self.recorded = []
++
++    def calculate_sl_tp(self, price, direction, df):
++        if self.raise_sltp:
++            raise RuntimeError("simulated sl/tp calculation failure")
++        return self.sl, self.tp
++
++    async def calculate_position_size(self, figi, price, df):
++        return self.size
++
++    def record_trade(self, figi):
++        self.recorded.append(figi)
++
++    def export_state(self):
++        return {"fake": True}
++
++
++class FakeSM:
++    def __init__(self, signal="BUY", reason="unit-test-signal"):
++        self.signal = signal
++        self.reason = reason
++        self.calls = 0
++
++    def get_signal(self, df, price, drop_incomplete=True):
++        self.calls += 1
++        return self.signal, self.reason
++
++
++def small_df():
++    import pandas as pd
++    return pd.DataFrame({"close": [100.0, 101.0, 99.0, 100.5, 100.2]})
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    """Изоляция файловых побочных эффектов main/logger + включённая торговля."""
++    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
++    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
++    monkeypatch.setattr(main, "TRADING_FLAG", str(tmp_path / "trading.flag"))
++    monkeypatch.setattr(research_logger, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
++    monkeypatch.setattr(research_logger, "TRADES_FILE", str(tmp_path / "trades.csv"))
++    monkeypatch.setattr(main, "reconcile_done", True)
++    monkeypatch.setattr(main, "state_save_failed", False)
++    monkeypatch.setattr(main, "top_instruments", [])
++    # свечи для расчёта SL/TP — mocked (стратегия не тестируется здесь)
++    async def fake_candles(client, figi):
++        return small_df()
++    monkeypatch.setattr(main, "_build_candles_df", fake_candles)
++    # торговля включена (флаг в tmp)
++    with open(tmp_path / "trading.flag", "w", encoding="utf-8") as f:
++        f.write(datetime.now(timezone.utc).isoformat())
++    return SimpleNamespace(tmp_path=tmp_path)
++
++
++def ledger_line(oid, status="INTENT", figi=FIGI, side="BUY", requested=10, executed=0,
++                created_at=None, updated_at=None, reason="", trade_id="t-1"):
++    ts = (updated_at or created_at or datetime.now(timezone.utc)).isoformat()
++    rec = {
++        "timestamp_utc": ts, "status": status, "order_id": oid,
++        "trade_id": trade_id, "figi": figi, "ticker": TICKER, "side": side,
++        "requested_lots": requested, "executed_lots": executed, "lots_left": None,
++        "avg_exec_price": None, "reason": reason, "source": "test", "error": None,
++        "created_at_utc": (created_at or ts).isoformat() if isinstance(created_at or ts, datetime) else (created_at or ts),
++        "updated_at_utc": (updated_at or ts).isoformat() if isinstance(updated_at or ts, datetime) else (updated_at or ts),
++    }
++    return json.dumps(rec, ensure_ascii=False)
++
++
++def make_ledger(tmp_path):
++    return OrderLedger(str(tmp_path / "order_ledger.jsonl"))
++
++
++def make_instruments(figi=FIGI):
++    return [{"figi": figi, "ticker": TICKER}]
++
++
++async def run_entry_cycle(client, rm, sm, monitor, ledger, figi=FIGI):
++    monkey_free = SimpleNamespace()  # placeholder, не используется
++    main.top_instruments.clear()
++    main.top_instruments.extend(make_instruments(figi))
++    client.prices_value = {figi: 100.0}
++    await main.trading_cycle(client, rm, sm, monitor, ledger)
++
++
++# ============================================================
++# Дефект №1: потеря частичного исполнения после отмены остатка
++# ============================================================
++
++@pytest.mark.asyncio
++async def test_scenario_1_partial_buy_cancelled_portfolio_silent(env):
++    """Сценарий 1 / Дефект №1: частичный BUY, остаток CANCELLED, портфель
++    ВРЕМЕННО не показывает позицию — исполнение НЕ теряется, позиция
++    регистрируется ровно в подтверждённом количестве."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})          # портфель временно пуст
++    client.post_state = fake_state(PARTIALLYFILL, lots_executed=2)
++    client.final_state = fake_state(CANCELLED, lots_executed=3, price_units=300)  # итог 300 = 3 лота * 100
++    monitor = ExecutionMonitor(client)
++    rm = FakeRM(sl=95.0, tp=110.0, size=5)
++    sm = FakeSM("BUY")
++    main.monitor_ref = monitor
++    main.ledger_ref = ledger
++
++    await run_entry_cycle(client, rm, sm, monitor, ledger)
++
++    # ПОСЛЕДСТВИЯ: позиция появилась, ровно исполненное количество (3 из 5)
++    assert client.last_post is not None
++    oid = client.last_post["order_id"]
++    pos = monitor.get_position(FIGI)
++    assert pos is not None, "подтверждённое исполнение потеряно"
++    assert pos.quantity == 3, f"в позицию попало неверное количество: {pos.quantity}"
++    assert pos.state == PositionState.OPEN     # цена и SL/TP были доступны
++    assert pos.entry_price == 100.0
++    assert pos.sl_price == 95.0 and pos.tp_price == 110.0
++    assert pos.partial is True
++    # Статус заявки и факт исполнения раздельно: заявка CANCELLED с исполнением
++    rec = ledger.latest(oid)
++    assert rec["status"] == "CANCELLED"
++    assert rec["executed_lots"] == 3
++    assert len(client.cancel_calls) == 1
++    # Дубликат не создан
++    assert len(monitor.positions) == 1
++
++
++@pytest.mark.asyncio
++async def test_defect1_unavailable_portfolio_with_confirmed_lots_registers(env):
++    """Дефект №1 (снимок недоступен): брокер подтвердил lots_executed>0, но
++    свежий снимок портфеля ВТОРОЙ запрос вернул недостоверным — исполнение
++    всё равно регистрируется (отсутствие снимка не отменяет исполнение)."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})         # первый снимок (шаг 6) корректен
++    client.positions_after_first = None       # свежий снимок в ветке partial недостоверен
++    client.post_state = fake_state(PARTIALLYFILL, lots_executed=1)
++    client.final_state = fake_state(CANCELLED, lots_executed=2, price_units=200)  # итог 200 = 2 лота * 100
++    monitor = ExecutionMonitor(client)
++    rm = FakeRM(sl=95.0, tp=110.0, size=5)
++    sm = FakeSM("BUY")
++    main.monitor_ref = monitor
++    main.ledger_ref = ledger
++
++    await run_entry_cycle(client, rm, sm, monitor, ledger)
++
++    oid = client.last_post["order_id"]
++    pos = monitor.get_position(FIGI)
++    assert pos is not None, "исполнение потеряно при недоступном снимке"
++    assert pos.quantity == 2
++    assert pos.state == PositionState.OPEN     # df доступен — SL/TP рассчитаны
++    rec = ledger.latest(oid)
++    assert rec["executed_lots"] == 2
++
++
++# ============================================================
++# Дефект №2: CANCELLED/EXPIRED с исполненными лотами
++# ============================================================
++
++async def _poll_cancelled_with_execution(env, status_code):
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    oid = "oid-terminal-exec"
++    ledger.record_intent(oid, trade_id="t-1", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=10)
++    client.order_states[oid] = fake_state(status_code, lots_executed=3, price_units=100)
++    monitor = ExecutionMonitor(client)
++    rm = FakeRM()
++    await main.poll_open_orders(client, monitor, rm, ledger)
++    return ledger, client, monitor, oid
++
++
++@pytest.mark.asyncio
++async def test_scenario_2_cancelled_with_executed_lots(env):
++    """Сценарий 2 / Дефект №2: CANCELLED с lots_executed=3 — отменённая заявка
++    С ЧАСТИЧНЫМ ИСПОЛНЕНИЕМ; в позиции ровно 3 лота (не 10), статус заявки
++    в реестре CANCELLED (не FILL), partial=True."""
++    ledger, client, monitor, oid = await _poll_cancelled_with_execution(env, CANCELLED)
++    pos = monitor.get_position(FIGI)
++    assert pos is not None, "исполненная часть не зарегистрирована"
++    assert pos.quantity == 3, "неисполненный остаток попал в позицию"
++    assert pos.partial is True
++    assert pos.state == PositionState.RECOVERY  # свечей нет — RECOVERY, не фиктивные данные
++    rec = ledger.latest(oid)
++    assert rec["status"] == "CANCELLED", f"статус заявки искажён: {rec['status']}"
++    assert rec["executed_lots"] == 3
++
++
++@pytest.mark.asyncio
++async def test_scenario_3_expired_with_executed_lots(env):
++    """Сценарий 3 / Дефект №2: EXPIRED с lots_executed=3 — истёкшая заявка
++    с частичным исполнением; позиция = 3 лота, статус EXPIRED."""
++    ledger, client, monitor, oid = await _poll_cancelled_with_execution(env, EXPIRED)
++    pos = monitor.get_position(FIGI)
++    assert pos is not None
++    assert pos.quantity == 3
++    assert pos.partial is True
++    rec = ledger.latest(oid)
++    assert rec["status"] == "EXPIRED"
++    assert rec["executed_lots"] == 3
++
++
++@pytest.mark.asyncio
++async def test_scenario_4_repeated_poll_no_quantity_doubling(env):
++    """Сценарий 4 / Дефект №2: повторный опрос частично исполненной заявки
++    не дублирует позицию и не прибавляет уже учтённые лоты."""
++    ledger, client, monitor, oid = await _poll_cancelled_with_execution(env, CANCELLED)
++    pos = monitor.get_position(FIGI)
++    assert pos is not None and pos.quantity == 3
++
++    # повторный опрос той же заявки
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    assert len(monitor.positions) == 1, "создан дубликат позиции"
++    assert monitor.get_position(FIGI).quantity == 3, "лоты прибавлены повторно"
++
++
++@pytest.mark.asyncio
++async def test_scenario_5_late_execution_after_cancel(env):
++    """Сценарий 5 / Дефект №2: позднее исполнение — брокер обновляет состояние
++    ПОСЛЕ отмены (2 -> 5 лотов): исполненная часть растёт до 5, дубликата нет,
++    уже учтённые лоты не прибавляются повторно (синхронизация RECOVERY)."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    oid = "oid-late"
++    ledger.record_intent(oid, trade_id="t-2", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=10)
++    monitor = ExecutionMonitor(client)
++
++    # Фаза 1: частичное исполнение 2 лота, отмена остатка
++    # (исполненная часть регистрируется ДО отмены — дефект №1)
++    client.order_states[oid] = fake_state(PARTIALLYFILL, lots_executed=2, price_units=100)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    assert monitor.get_position(FIGI).quantity == 2
++    assert client.cancel_calls == [oid]
++
++    # Фаза 2: брокер обновил состояние после отмены — исполнено 5 лотов,
++    # заявка переведена в терминальный CANCELLED
++    client.order_states[oid] = fake_state(CANCELLED, lots_executed=5, price_units=100)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    assert len(monitor.positions) == 1, "дубликат при позднем исполнении"
++    pos = monitor.get_position(FIGI)
++    assert pos.quantity == 5, "позднее исполнение не учтено"
++    assert pos.state == PositionState.RECOVERY
++    rec = ledger.latest(oid)
++    assert rec["status"] == "CANCELLED"
++    assert rec["executed_lots"] == 5
++
++
++@pytest.mark.asyncio
++async def test_poll_registers_before_cancel(env):
++    """Дефект №1 (принцип в poll): подтверждённые лоты регистрируются ДО
++    отмены остатка — отменённая часть не теряет уже исполненное."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    oid = "oid-partial-live"
++    ledger.record_intent(oid, trade_id="t-3", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=10)
++    client.order_states[oid] = fake_state(PARTIALLYFILL, lots_executed=4, price_units=100)
++    monitor = ExecutionMonitor(client)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    # исполненная часть зарегистрирована сразу, остаток отменён
++    assert client.cancel_calls == [oid]
++    pos = monitor.get_position(FIGI)
++    assert pos is not None
++    assert pos.quantity == 4
++    rec = ledger.latest(oid)
++    assert "cancel_requested" in (rec.get("reason") or "")
++    assert rec["executed_lots"] == 4
++
++
++# ============================================================
++# Дефект №3: возраст заявки не сбрасывается
++# ============================================================
++
++def test_defect3_created_at_not_reset_by_status_updates(env, tmp_path):
++    """Сценарий 6 (юнит-часть) / Дефект №3: record_status (NEW) НЕ сбрасывает
++    created_at_utc; обновляется только updated_at_utc/timestamp_utc."""
++    ledger = make_ledger(tmp_path)
++    oid = "oid-age"
++    ledger.record_intent(oid, trade_id="t-4", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=10)
++    rec0 = ledger.latest(oid)
++    created0 = rec0["created_at_utc"]
++    assert created0 is not None
++
++    # несколько опросов подряд (как в цикле)
++    for _ in range(3):
++        ledger.record_status(oid, "NEW", executed_lots=0,
++                             reason="активна, под наблюдением опроса", source="poll")
++    rec = ledger.latest(oid)
++    assert rec["created_at_utc"] == created0, "возраст сброшен обновлением статуса"
++    assert rec["timestamp_utc"] > rec["created_at_utc"]
++    # возраст в циклах положительный и не обнулён
++    age = main._age_in_cycles(rec)
++    assert age > 0.0
++
++
++@pytest.mark.asyncio
++async def test_scenario_6_new_order_regularly_polled_reaches_timeout(env):
++    """Сценарий 6 / Дефект №3: заявка NEW регулярно опрашивается и всё равно
++    достигает таймаута — остаток отменяется (возраст считается от INTENT)."""
++    ledger = make_ledger(env.tmp_path)
++    oid = "oid-aged"
++    created = datetime.now(timezone.utc) - timedelta(
++        seconds=(main.ORDER_POLL_MAX_AGE_CYCLES + 5) * config.TRADING_CYCLE_SECONDS)
++    # запись с давним created_at (как после долгой жизни заявки), статус NEW
++    path = ledger.path
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(ledger_line(oid, status="NEW", created_at=created, updated_at=created) + "\n")
++    ledger.load()
++
++    client = FakeClient(positions={})
++    client.order_states[oid] = fake_state(NEW, lots_executed=0)
++    monitor = ExecutionMonitor(client)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    assert client.cancel_calls == [oid], "таймаут не достигается при регулярном опросе"
++    rec = ledger.latest(oid)
++    assert "cancel_requested" in (rec.get("reason") or "")
++
++
++def test_scenario_7_age_restored_after_restart(env, tmp_path):
++    """Сценарий 7 / Дефект №3: после перезапуска робота возраст восстанавливается
++    из реестра (created_at_utc хранится в журнале), а не начинается заново."""
++    path = str(tmp_path / "order_ledger.jsonl")
++    oid = "oid-restart"
++    created = datetime.now(timezone.utc) - timedelta(
++        seconds=(main.ORDER_POLL_MAX_AGE_CYCLES + 10) * config.TRADING_CYCLE_SECONDS)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(ledger_line(oid, status="INTENT", created_at=created) + "\n")
++
++    # «перезапуск»: новый экземпляр реестра
++    ledger = OrderLedger(path)
++    ledger.load()
++    assert ledger.latest(oid) is not None
++    # опрос обновил статус — created_at сохранился
++    ledger.record_status(oid, "NEW", executed_lots=0, source="poll")
++    rec = ledger.latest(oid)
++    assert main._age_in_cycles(rec) >= main.ORDER_POLL_MAX_AGE_CYCLES, \
++        "возраст не восстановлен из реестра после перезапуска"
++
++
++# ============================================================
++# Дефект №4: неизвестная заявка блокирует BUY
++# ============================================================
++
++@pytest.mark.asyncio
++async def test_scenario_8_unknown_side_order_blocks_buy_by_figi(env):
++    """Сценарий 8 / Дефект №4: неизвестная заявка с side=None (направление не
++    распознано) блокирует новые BUY по своему FIGI; существующие позиции
++    продолжают мониториться."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    client.orders_list = [
++        SimpleNamespace(order_id="u1", figi=FIGI, direction=None,
++                        lots_requested=5, lots_executed=0),
++    ]
++    monitor = ExecutionMonitor(client)
++    # существующая позиция по другому инструменту — должна остаться под мониторингом
++    monitor.register(figi=OTHER_FIGI, ticker="OTHER", direction="BUY",
++                     entry_price=100.0, quantity=1, sl_price=99.0, tp_price=102.0,
++                     lot_size=1, trade_id="t-other", entry_requested_lots=1)
++
++    await main.startup_recovery(client, monitor, FakeRM(), ledger)
++
++    rec = ledger.latest("u1")
++    assert rec is not None and rec["status"] == "UNCERTAIN"
++    assert rec.get("side") is None
++    assert ledger.figi_blocks_buy(FIGI) is True, "side=None не блокирует BUY по FIGI"
++    assert ledger.figi_blocks_buy(OTHER_FIGI) is False
++    assert ledger.has_unknown_figi_open_orders() is False
++    # существующие позиции продолжают мониториться
++    assert monitor.get_position(OTHER_FIGI).state == PositionState.OPEN
++    assert monitor.active_count() == 1
++
++    # и торговый цикл не входит по этому FIGI
++    rm, sm = FakeRM(), FakeSM("BUY")
++    await run_entry_cycle(client, rm, sm, monitor, ledger)
++    assert sm.calls == 0, "BUY разрешён при неизвестной заявке по FIGI"
++    assert client.last_post is None
++
++
++@pytest.mark.asyncio
++async def test_scenario_9_unknown_figi_order_blocks_buy_globally(env):
++    """Сценарий 9 / Дефект №4: неизвестная заявка БЕЗ FIGI блокирует ВСЕ новые
++    BUY глобально до разрешения неопределённости."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    client.orders_list = [
++        SimpleNamespace(order_id="u2", figi=None, direction=1,
++                        lots_requested=5, lots_executed=0),
++    ]
++    monitor = ExecutionMonitor(client)
++    await main.startup_recovery(client, monitor, FakeRM(), ledger)
++
++    rec = ledger.latest("u2")
++    assert rec is not None and rec["status"] == "UNCERTAIN"
++    assert ledger.has_unknown_figi_open_orders() is True
++
++    rm, sm = FakeRM(), FakeSM("BUY")
++    await run_entry_cycle(client, rm, sm, monitor, ledger)
++    assert sm.calls == 0, "глобальная блокировка не сработала"
++    assert client.last_post is None
++
++
++@pytest.mark.asyncio
++async def test_defect4_unknown_side_resolves_only_without_execution(env):
++    """Дефект №4 (разрешение): заявка с side=None разрешается ТОЛЬКО при
++    достоверном завершении без исполнения; при признаках исполнения остаётся
++    UNCERTAIN (BUY не разблокируются)."""
++    ledger = make_ledger(env.tmp_path)
++    oid = "u3"
++    ledger.record_uncertain(oid, figi=FIGI, ticker=TICKER, side=None,
++                            requested_lots=5, source="startup",
++                            reason="активная заявка брокера без записи в реестре")
++    client = FakeClient(positions={})
++    monitor = ExecutionMonitor(client)
++
++    # (а) признаки исполнения при неизвестной стороне — остаётся UNCERTAIN
++    client.order_states[oid] = fake_state(CANCELLED, lots_executed=2)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    rec = ledger.latest(oid)
++    assert rec["status"] == "UNCERTAIN", "неизвестная сторона не должна авторазрешаться при исполнении"
++    assert ledger.figi_blocks_buy(FIGI) is True
++    # позиция НЕ регистрировалась автоматически
++    assert monitor.get_position(FIGI) is None
++
++    # (б) достоверное завершение без исполнения — блокировка снимается
++    client.order_states[oid] = fake_state(CANCELLED, lots_executed=0)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    rec = ledger.latest(oid)
++    assert rec["status"] == "CANCELLED"
++    assert ledger.figi_blocks_buy(FIGI) is False
++
++
++# ============================================================
++# Дефект №5: повреждение OrderLedger не превращается в пустой реестр
++# ============================================================
++
++async def _assert_buy_blocked(env, ledger, client, monitor):
++    rm, sm = FakeRM(), FakeSM("BUY")
++    main.ledger_ref = ledger
++    await run_entry_cycle(client, rm, sm, monitor, ledger)
++    assert sm.calls == 0, "новые BUY не заблокированы"
++    assert client.last_post is None
++
++
++@pytest.mark.asyncio
++async def test_scenario_10_corrupted_ledger_blocks_buy(env):
++    """Сценарий 10 / Дефект №5: повреждённая строка журнала (в середине) —
++    реестр недостоверен, новые BUY запрещены, журнал НЕ перезаписывается,
++    целые записи продолжают читаться (best effort)."""
++    path = str(env.tmp_path / "order_ledger.jsonl")
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(ledger_line("oidA", status="INTENT", figi=FIGI) + "\n")
++        f.write("{этот json повреждён\n")
++        f.write(ledger_line("oidB", status="INTENT", figi=OTHER_FIGI) + "\n")
++
++    ledger = OrderLedger(path)
++    ledger.load()
++    assert ledger.is_reliable() is False, "повреждение не обнаружено"
++    assert "повреждён" in ledger.unreliable_reason
++    # best effort: целые записи загружены, не выброшены
++    assert ledger.latest("oidA") is not None
++    assert ledger.latest("oidB") is not None
++    # исходный журнал не удалён и не перезаписан
++    raw = open(path, "r", encoding="utf-8").read()
++    assert "{этот json повреждён" in raw
++
++    client = FakeClient(positions={})
++    monitor = ExecutionMonitor(client)
++    await _assert_buy_blocked(env, ledger, client, monitor)
++
++
++@pytest.mark.asyncio
++async def test_scenario_11_ledger_read_error_blocks_buy(env, monkeypatch):
++    """Сценарий 11 / Дефект №5: ошибка чтения реестра — явное состояние
++    недостоверности (не «пустой достоверный реестр»), новые BUY запрещены."""
++    path = str(env.tmp_path / "order_ledger.jsonl")
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(ledger_line("oidC", status="INTENT", figi=FIGI) + "\n")
++
++    ledger = OrderLedger(path)
++    real_open = builtins.open
++
++    def broken_open(file, mode="r", *a, **kwargs):
++        try:
++            same = os.path.abspath(str(file)) == os.path.abspath(path)
++        except Exception:
++            same = False
++        if same and "r" in str(mode):
++            raise PermissionError(13, "simulated read failure")
++        return real_open(file, mode, *a, **kwargs)
++
++    monkeypatch.setattr(builtins, "open", broken_open)
++    ledger.load()
++    assert ledger.is_reliable() is False, "ошибка чтения не перевела реестр в недостоверность"
++    assert ledger.unreliable_reason
++    monkeypatch.undo()
++
++    client = FakeClient(positions={})
++    monitor = ExecutionMonitor(client)
++    await _assert_buy_blocked(env, ledger, client, monitor)
++
++
++@pytest.mark.asyncio
++async def test_defect5_tail_corruption_no_truncate_blocks_buy(env):
++    """Дефект №5: повреждённый ХВОСТ журнала не обрезается, не молчит и
++    запрещает новые BUY до восстановления целостности."""
++    path = str(env.tmp_path / "order_ledger.jsonl")
++    with open(path, "w", encoding="utf-8") as f:
++        f.write(ledger_line("oidD", status="INTENT", figi=FIGI) + "\n")
++        f.write('{"status": "INTENT", "order_id": "oidE", "trunc')  # обрыв append
++
++    ledger = OrderLedger(path)
++    ledger.load()
++    assert ledger.is_reliable() is False
++    raw = open(path, "r", encoding="utf-8").read()
++    assert '"trunc' in raw, "журнал был перезаписан/обрезан"
++    client = FakeClient(positions={})
++    monitor = ExecutionMonitor(client)
++    await _assert_buy_blocked(env, ledger, client, monitor)
++
++
++@pytest.mark.asyncio
++async def test_defect5_missing_file_is_valid_empty_registry(env):
++    """Дефект №5 (граница): ОТСУТСТВУЮЩИЙ журнал — валидный пустой реестр
++    (заявок не было), торговля не блокируется."""
++    ledger = OrderLedger(str(env.tmp_path / "not_existing.jsonl"))
++    ledger.load()
++    assert ledger.is_reliable() is True
++
++
++# ============================================================
++# Дефект №6: знак количества SHORT в RECOVERY
++# ============================================================
++
++def test_scenario_12_short_recovery_quantity_canonical(env):
++    """Сценарий 12 / Дефект №6: SHORT RECOVERY хранит канонически ПОЛОЖИТЕЛЬНОЕ
++    количество; знак брокера не попадает в pos.quantity; противоречащий знак
++    не синхронизируется; ноль не закрывает RECOVERY автоматически. LONG
++    проверен отдельно."""
++    client = FakeClient()
++    mon = ExecutionMonitor(client)
++
++    # --- SHORT ---
++    short = mon.register_recovery(figi=FIGI, ticker=TICKER, direction="SELL",
++                                  quantity=5, lot_size=1, recovery_source="adopted")
++    assert short.quantity == 5
++    # брокер сообщает -7 (SHORT со знаком) — локально 7 положительных лотов
++    assert mon.sync_recovery_quantity(short, -7) is True
++    assert short.quantity == 7, "знак брокера попал в pos.quantity"
++    assert short.executed_lots == 7 and short.entry_applied_lots == 7
++    assert short.direction == "SELL"
++    # знак, противоречащий направлению, НЕ синхронизируется
++    assert mon.sync_recovery_quantity(short, 3) is False
++    assert short.quantity == 7
++    # ноль не синхронизируется и НЕ закрывает RECOVERY
++    assert mon.sync_recovery_quantity(short, 0) is False
++    assert short.state == PositionState.RECOVERY
++    # то же значение — без изменений
++    assert mon.sync_recovery_quantity(short, -7) is False
++
++    # --- LONG отдельно ---
++    long_pos = mon.register_recovery(figi=OTHER_FIGI, ticker="OTHER", direction="BUY",
++                                     quantity=3, lot_size=1, recovery_source="adopted")
++    assert mon.sync_recovery_quantity(long_pos, 6) is True
++    assert long_pos.quantity == 6
++    assert mon.sync_recovery_quantity(long_pos, -2) is False  # знак против LONG
++    assert long_pos.quantity == 6
++
++
++def test_defect6_resolve_uncertain_short_uses_abs(env):
++    """Дефект №6: resolve_uncertain для SHORT сравнивает количество по модулю
++    (знак проверен через направление) — SHORT не застревает в UNCERTAIN."""
++    client = FakeClient()
++    mon = ExecutionMonitor(client)
++    pos = mon.register_recovery(figi=FIGI, ticker=TICKER, direction="SELL",
++                                quantity=5, lot_size=1, recovery_source="adopted")
++    pos.state = PositionState.UNCERTAIN
++
++    broker = {FIGI: PositionData(lots=-5, direction="SHORT", raw_shares=Decimal(-5))}
++    mon.resolve_uncertain(pos, broker)
++    assert pos.state == PositionState.OPEN
++    assert pos.quantity == 5, "отрицательное количество попало в позицию"
++
++    # расхождение по количеству — остаётся UNCERTAIN
++    pos2 = mon.register_recovery(figi=OTHER_FIGI, ticker="OTHER", direction="SELL",
++                                 quantity=5, lot_size=1, recovery_source="adopted")
++    pos2.state = PositionState.UNCERTAIN
++    broker2 = {OTHER_FIGI: PositionData(lots=-3, direction="SHORT", raw_shares=Decimal(-3))}
++    mon.resolve_uncertain(pos2, broker2)
++    assert pos2.state == PositionState.UNCERTAIN
++
++
++# ============================================================
++# Дефект №7: исключение calculate_sl_tp не срывает регистрацию
++# ============================================================
++
++@pytest.mark.asyncio
++async def test_scenario_13_sltp_exception_still_registers_recovery(env):
++    """Сценарий 13 / Дефект №7: calculate_sl_tp() выбросил исключение ПОСЛЕ
++    подтверждённого исполнения — позиция создаётся как RECOVERY с известными
++    данными, без фиктивных цены/SL/TP, и НЕ закрывается автоматически."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient()
++    monitor = ExecutionMonitor(client)
++    rm = FakeRM(raise_sltp=True)
++
++    pos = await main.register_executed_buy(
++        client, monitor, rm, ledger,
++        figi=FIGI, ticker=TICKER, order_id="oid-sltp", trade_id="t-5",
++        reason="unit", signal_time="now", price_before_order=100.0,
++        order_send_time="now", requested_lots=4, executed_lots=4,
++        exec_price=100.0, lot_size=1, partial=False,
++        df=small_df(), source="test",
++    )
++    # ПОСЛЕДСТВИЯ: позиция существует, исполнение не потеряно
++    assert pos is not None
++    assert pos.state == PositionState.RECOVERY
++    assert pos.quantity == 4
++    assert pos.entry_order_id == "oid-sltp"
++    assert pos.direction == "BUY"
++    assert pos.execution_price == 100.0      # известная цена исполнения сохранена
++    assert pos.entry_price == 0.0            # фиктивная цена входа НЕ установлена
++    assert pos.sl_price == 0.0 and pos.tp_price == 0.0  # фиктивные SL/TP НЕ созданы
++
++    # RECOVERY не закрывается автоматически при SL/TP-мониторинге
++    to_close = await monitor.check_all({FIGI: 50.0})
++    assert to_close == []
++    assert monitor.get_position(FIGI).state == PositionState.RECOVERY
++
++    # запись в реестре связана с заявкой
++    rec = ledger.latest("oid-sltp")
++    assert rec is not None
++    assert rec["executed_lots"] == 4
++
++
++# ============================================================
++# Дефект №8: противоречивый FILL с нулём исполненных лотов
++# ============================================================
++
++def test_scenario_14_record_sent_fill_zero_lots_not_confirmed(env, tmp_path):
++    """Сценарий 14 / Дефект №8: ответ FILL с lots_executed=0 НЕ фиксируется
++    как терминальный FILL: заявка остаётся UNCERTAIN, доступна для разрешения,
++    FIGI заблокирован для новых BUY."""
++    ledger = make_ledger(tmp_path)
++    oid = "oid-fill0"
++    assert ledger.record_intent(oid, trade_id="t-6", figi=FIGI, ticker=TICKER,
++                                side="BUY", requested_lots=5) is True
++    ok = ledger.record_sent(oid, figi=FIGI, ticker=TICKER, side="BUY",
++                            requested_lots=5, executed_lots=0, status_hint="FILL",
++                            source="post_response")
++    assert ok is True
++    rec = ledger.latest(oid)
++    assert rec["status"] == "UNCERTAIN", f"FILL с нулём лотов записан как {rec['status']}"
++    # заявка доступна для дальнейшего разрешения
++    assert ledger.has_order(oid)
++    assert any(r["order_id"] == oid for r in ledger.open_orders(side="BUY"))
++    assert ledger.figi_blocks_buy(FIGI) is True
++
++    # executed_lots=None — тоже не подтверждённый FILL
++    oid2 = "oid-fill-null"
++    ledger.record_intent(oid2, trade_id="t-7", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=5)
++    ledger.record_sent(oid2, figi=FIGI, side="BUY", executed_lots=None, status_hint="FILL")
++    assert ledger.latest(oid2)["status"] == "UNCERTAIN"
++
++    # FILL с подтверждёнными лотами остаётся FILL (норма не сломана)
++    oid3 = "oid-fill-ok"
++    ledger.record_intent(oid3, trade_id="t-8", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=5)
++    ledger.record_sent(oid3, figi=FIGI, side="BUY", executed_lots=5, status_hint="FILL")
++    assert ledger.latest(oid3)["status"] == "FILL"
++
++
++@pytest.mark.asyncio
++async def test_scenario_14_fill_zero_lots_resolves_after_reconnect(env):
++    """Дефект №8 (продолжение): после восстановления связи робот повторно
++    запрашивает состояние у брокера и разрешает заявку (позиция 5 лотов)."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    oid = "oid-fill0-reconnect"
++    ledger.record_intent(oid, trade_id="t-9", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=5)
++    # противоречивый ответ post: FILL с 0 лотов
++    ledger.record_sent(oid, figi=FIGI, side="BUY", executed_lots=0, status_hint="FILL")
++    assert ledger.latest(oid)["status"] == "UNCERTAIN"
++
++    monitor = ExecutionMonitor(client)
++    # связь недоступна: заявка остаётся в реестре
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    assert ledger.latest(oid)["status"] == "UNCERTAIN"
++
++    # связь восстановлена — повторный запрос состояния у брокера
++    client.order_states[oid] = fake_state(FILL, lots_executed=5, price_units=100)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    pos = monitor.get_position(FIGI)
++    assert pos is not None and pos.quantity == 5
++    rec = ledger.latest(oid)
++    assert rec["status"] == "FILL"
++    assert rec["executed_lots"] == 5
++
++
++@pytest.mark.asyncio
++async def test_defect8_poll_fill_zero_lots_stays_uncertain(env):
++    """Дефект №8 в poll: FILL с lots_executed=0 — UNCERTAIN, НЕ терминальный,
++    НЕ отказ; FIGI остаётся заблокированным."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    oid = "oid-poll-fill0"
++    ledger.record_intent(oid, trade_id="t-10", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=5)
++    client.order_states[oid] = fake_state(FILL, lots_executed=0)
++    monitor = ExecutionMonitor(client)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    rec = ledger.latest(oid)
++    assert rec["status"] == "UNCERTAIN"
++    assert monitor.get_position(FIGI) is None
++    assert ledger.figi_blocks_buy(FIGI) is True
++
++
++# ============================================================
++# Идемпотентность восстановления (сценарии 15, 16)
++# ============================================================
++
++@pytest.mark.asyncio
++async def test_scenario_15_repeated_recovery_same_order_id_no_duplicate(env):
++    """Сценарий 15: повторное восстановление одного и того же order_id не
++    создаёт дубликат позиции и не удваивает количество."""
++    client = FakeClient()
++    monitor = ExecutionMonitor(client)
++    ledger = make_ledger(env.tmp_path)
++    rm = FakeRM()
++    kwargs = dict(
++        figi=FIGI, ticker=TICKER, order_id="oid-same", trade_id="t-11",
++        reason="unit", signal_time="now", price_before_order=100.0,
++        order_send_time="now", requested_lots=4, executed_lots=4,
++        exec_price=100.0, lot_size=1, partial=False, df=None, source="test",
++    )
++    pos1 = await main.register_executed_buy(client, monitor, rm, ledger, **kwargs)
++    pos2 = await main.register_executed_buy(client, monitor, rm, ledger, **kwargs)
++    assert pos1 is pos2, "создан второй объект позиции"
++    assert len(monitor.positions) == 1
++    assert monitor.get_position(FIGI).quantity == 4, "количество удвоено"
++
++
++@pytest.mark.asyncio
++async def test_scenario_16_registered_partial_not_added_again(env):
++    """Сценарий 16: уже зарегистрированное частичное исполнение не прибавляется
++    повторно при повторном опросе той же заявки."""
++    client = FakeClient(positions={})
++    monitor = ExecutionMonitor(client)
++    ledger = make_ledger(env.tmp_path)
++    oid = "oid-partial-reg"
++    ledger.record_intent(oid, trade_id="t-12", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=10)
++    # прямая регистрация частичного исполнения (3 из 10)
++    await main.register_executed_buy(
++        client, monitor, FakeRM(), ledger,
++        figi=FIGI, ticker=TICKER, order_id=oid, trade_id="t-12",
++        reason="unit", signal_time="now", price_before_order=100.0,
++        order_send_time="now", requested_lots=10, executed_lots=3,
++        exec_price=100.0, lot_size=1, partial=True, df=None, source="test",
++    )
++    assert monitor.get_position(FIGI).quantity == 3
++
++    # повторный опрос заявки с тем же исполнением
++    client.order_states[oid] = fake_state(CANCELLED, lots_executed=3, price_units=100)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    assert len(monitor.positions) == 1
++    assert monitor.get_position(FIGI).quantity == 3, "частичное исполнение прибавлено повторно"
++
++
++@pytest.mark.asyncio
++async def test_defect2_only_executed_quantity_registered(env):
++    """Дефект №2: в позицию регистрируется только реально исполненное
++    количество; неисполненный остаток (10-2=8) не попадает в позицию."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={})
++    oid = "oid-exec-only"
++    ledger.record_intent(oid, trade_id="t-13", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=10)
++    client.order_states[oid] = fake_state(CANCELLED, lots_executed=2, price_units=100)
++    monitor = ExecutionMonitor(client)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    pos = monitor.get_position(FIGI)
++    assert pos is not None
++    assert pos.quantity == 2
++    assert pos.entry_requested_lots in (10, 0)  # запрошенное количество не смешано с исполненным
++    assert pos.entry_applied_lots == 2
++
++
++# ============================================================
++# Дополнительно: согласованность блокировок и менеджмента позиций
++# ============================================================
++
++@pytest.mark.asyncio
++async def test_uncertain_buy_order_does_not_block_position_management(env):
++    """Неопределённая BUY-заявка блокирует только НОВЫЕ входы; управление уже
++    открытой позицией (SL/TP) продолжается."""
++    ledger = make_ledger(env.tmp_path)
++    client = FakeClient(positions={FIGI: PositionData(lots=1, direction="LONG",
++                                                      raw_shares=Decimal(1))})
++    ledger.record_intent("oid-block", trade_id="t-14", figi=FIGI, ticker=TICKER,
++                         side="BUY", requested_lots=1)
++    monitor = ExecutionMonitor(client)
++    monitor.register(figi=FIGI, ticker=TICKER, direction="BUY",
++                     entry_price=100.0, quantity=1, sl_price=99.0, tp_price=102.0,
++                     lot_size=1, trade_id="t-15", entry_requested_lots=1)
++    # цена ниже SL — позиция должна уйти в CLOSING несмотря на неопределённость
++    prices = {FIGI: 98.0}
++    to_close = await monitor.check_all(prices)
++    assert len(to_close) == 1 and to_close[0].close_reason == "SL"
++    assert monitor.get_position(FIGI).state == PositionState.CLOSING
+diff -ruN a/tests/test_tinkoff_client.py b/tests/test_tinkoff_client.py
+--- a/tests/test_tinkoff_client.py	2026-11-18 13:34:41.185333992 +0000
++++ b/tests/test_tinkoff_client.py	2026-11-18 13:34:41.185333992 +0000
+@@ -103,13 +103,16 @@
+ 
+ @pytest.mark.asyncio
+ async def test_get_positions_unresolved_remainder():
++    """Обновлён (пояснение в шапке скрипта/диффа): по согласованному
++    fail-closed поведению частичный/недостоверный снимок возвращается
++    как None, а не частичный dict."""
+     c = make_client()
+     c.client.sandbox.get_sandbox_portfolio = AsyncMock(
+         return_value=FakePortfolio([FakePosition("F1", 15)])  # 15 штук
+     )
+     c.get_instrument_info = AsyncMock(return_value={"lot": 10})  # лот 10
+     result = await c.get_positions()
+-    assert result == {}  # позиция не возвращена
++    assert result is None  # снимок недостоверный: None, а не частичный dict
+     assert c.uncertain_state is True
+ 
+ 
+@@ -295,6 +298,10 @@
+     c.client.sandbox.get_sandbox_max_lots = mock
+     await c.get_sandbox_max_lots("F1", price=100.5)
+     args, kwargs = mock.call_args
+-    assert "price" in kwargs
+-    assert kwargs["price"].units == 100
+-    assert kwargs["price"].nano == 500000000
+\ No newline at end of file
++    # Обновлён: SDK принимает get_sandbox_max_lots(*, request: GetMaxLotsRequest);
++    # цена внутри request.price (проверено на реальном SDK).
++    assert "request" in kwargs
++    req = kwargs["request"]
++    assert req.instrument_id == "F1"
++    assert req.price.units == 100
++    assert req.price.nano == 500000000
+\ No newline at end of file
+diff -ruN a/tests/test_tinkoff_client_currency.py b/tests/test_tinkoff_client_currency.py
+--- a/tests/test_tinkoff_client_currency.py	2026-11-18 13:34:41.186333997 +0000
++++ b/tests/test_tinkoff_client_currency.py	2026-11-18 13:34:41.187334002 +0000
+@@ -78,7 +78,8 @@
+         "lot": 10, "instrument_type": "share", "ticker": "SBER", "name": "SBER",
+     })
+     result = await c.get_positions()
+-    assert result == {}
++    # Обновлён: fail-closed — недостоверный снимок возвращается как None
++    assert result is None
+     assert c.uncertain_state is True
+ 
+ 
+@@ -127,5 +128,6 @@
+ 
+     c.get_instrument_info = AsyncMock(side_effect=fake_info)
+     result = await c.get_positions()
+-    assert result == {}  # акция не включена
++    # Обновлён: fail-closed — ошибка акции делает весь снимок недостоверным
++    assert result is None  # частичный dict не выдаётся наружу
+     assert c.uncertain_state is True  # ошибка акции сохранена
+\ No newline at end of file
+diff -ruN a/tinkoff_client.py b/tinkoff_client.py
+--- a/tinkoff_client.py	2026-11-18 13:34:41.199334061 +0000
++++ b/tinkoff_client.py	2026-11-18 13:34:41.182333977 +0000
+@@ -66,9 +66,18 @@
+     OrderType,
+ )
+ from t_tech.invest.sandbox.async_client import AsyncSandboxClient
+-from t_tech.invest.grpc import GetMaxLotsRequest
+ from t_tech.invest.utils import now, quotation_to_decimal, decimal_to_quotation
+ 
++# GetMaxLotsRequest: путь импорта различается между сборками SDK.
++#   SDK 1.51.0 (боевая сборка владельца): t_tech.invest.grpc.GetMaxLotsRequest.
++#   SDK 0.3.3 (публичная сборка PyPI): класс есть, но экспортируется
++#   из t_tech.invest (t_tech.invest.grpc.__init__ его не реэкспортирует).
++#   Оба пути ведут к одному классу protobuf; первичный путь — 1.51.0.
++try:
++    from t_tech.invest.grpc import GetMaxLotsRequest
++except ImportError:
++    from t_tech.invest import GetMaxLotsRequest
++
+ import config
+ 
+ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
