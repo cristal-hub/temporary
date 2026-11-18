@@ -107,6 +107,28 @@
 #     количества RECOVERY-позиции по ДОСТОВЕРНОМУ снимку брокерского
 #     портфеля (reconcile-сверка, адопция).
 #
+# ИЗМЕНЕНИЯ (партия P0-4 — гонка reconcile() -> poll_open_orders() в RECOVERY):
+#   Дефект: reconcile() актуализирует остаток RECOVERY-позиции по достоверному
+#   снимку портфеля (8 -> 7), счётчики entry_applied_lots остаются 8; затем в
+#   том же цикле poll_open_orders() получает выросший накопительный
+#   lots_executed=10 той же заявки и прибавлял дельту (10-8=2) к остатку —
+#   7 -> 9, хотя дельта уже была отражена в снимке брокера. Порядок вызовов
+#   process_closing()/reconcile()/poll_open_orders() НЕ меняется: защита
+#   делается на уровне данных.
+#   - register_executed_buy(): рост lots_executed сверх учтённых ПОСЛЕ
+#     достоверной синхронизации остатка снимком (entry_snapshot_synced)
+#     НЕОДНОЗНАЧЕН: дельта к остатку НЕ добавляется (снимок мог уже учесть
+#     это исполнение), счётчики догоняются по отчёту заявки; неопределённость
+#     фиксируется существующей архитектурой (client.uncertain_state +
+#     UNCERTAIN-запись реестра — новые BUY по FIGI блокированы), остаток
+#     актуализируется сверкой reconcile.
+#   - promote_recovery_positions(): тот же рост откладывает промоцию до
+#     сверки — RECOVERY -> OPEN выполняется только с остатком,
+#     подтверждённым достоверным снимком; количество не уменьшается,
+#     противоречия (устаревший ответ) обрабатываются как прежде.
+#   - Порядок вызовов и остальные ветки жизненного цикла process_closing(),
+#     reconcile() и trading_cycle() не менялись.
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   _load_state, resolve_closing/resolve_uncertain (execution.py — см. его
@@ -913,6 +935,13 @@ async def register_executed_buy(
     """
     ЕДИНАЯ ТОЧКА регистрации исполненной BUY-заявки (этап 5, P0).
 
+    Партия P0-4: рост lots_executed сверх учтённых ПОСЛЕ достоверной
+    синхронизации остатка снимком портфеля (entry_snapshot_synced) —
+    НЕОДНОЗНАЧЕН: дельта к остатку НЕ добавляется (снимок мог уже учесть
+    это исполнение), счётчики догоняются по отчёту заявки, фиксируется
+    неопределённость существующей архитектурой (client.uncertain_state +
+    UNCERTAIN-запись реестра); остаток актуализируется сверкой reconcile.
+
     Гарантии:
       - подтверждённое исполнение (executed_lots > 0) не может быть потеряно:
         при отсутствии цены исполнения или SL/TP позиция регистрируется в
@@ -1004,6 +1033,7 @@ async def register_executed_buy(
         qty_before = existing.quantity
         applied = False
         contradiction = False
+        snapshot_covered_growth = False
         if existing.state == PositionState.RECOVERY:
             # Партия P0-3: повторная обработка накопительного lots_executed
             # BUY-заявки для RECOVERY-позиции — НЕ sync_recovery_quantity():
@@ -1022,6 +1052,18 @@ async def register_executed_buy(
             baseline_before = max(
                 int(existing.entry_applied_lots or 0),
                 seen_before if seen_before is not None else 0,
+            )
+            # Партия P0-4: рост lots_executed сверх учтённых ПОСЛЕ достоверной
+            # синхронизации остатка снимком портфеля (entry_snapshot_synced)
+            # НЕОДНОЗНАЧЕН: дельта могла быть уже отражена в остатке снимком
+            # (исполнение до снимка) или быть новой (исполнение после
+            # снимка) — по этим значениям неразличимо. Обрабатывается
+            # консервативно: record_recovery_entry_lots догоняет ТОЛЬКО
+            # счётчики, остаток не меняется; ниже фиксируется
+            # неопределённость существующей архитектурой.
+            snapshot_covered_growth = (
+                bool(existing.entry_snapshot_synced)
+                and int(executed_lots) > baseline_before
             )
             applied = monitor.record_recovery_entry_lots(
                 existing, executed_lots, order_id=order_id,
@@ -1049,13 +1091,41 @@ async def register_executed_buy(
                     f"{order_id} (lots_executed={executed_lots} < учтённых "
                     f"{baseline_before}) — UNCERTAIN, новые BUY по {figi} заблокированы"
                 )
+            elif snapshot_covered_growth:
+                # Партия P0-4: дельта к остатку НЕ добавлена (снимок мог уже
+                # учесть это исполнение — повторное применение после
+                # reconcile исключено), счётчики исполнения догнаны по
+                # отчёту заявки. Неопределённость фиксируется СУЩЕСТВУЮЩЕЙ
+                # архитектурой: client.uncertain_state + UNCERTAIN-запись
+                # реестра (новые BUY по FIGI блокированы); остаток
+                # актуализируется сверкой reconcile по достоверному снимку.
+                client.uncertain_state = True
+                if ledger is not None:
+                    ledger.record_uncertain(
+                        order_id, figi=figi, ticker=ticker,
+                        side="BUY", executed_lots=int(executed_lots),
+                        reason=(f"рост lots_executed={int(executed_lots)} сверх учтённых "
+                                f"{baseline_before} после достоверной синхронизации остатка "
+                                f"по снимку портфеля — дельта к остатку не добавлена "
+                                f"(снимок мог уже учесть это исполнение), требуется сверка"),
+                        source=source or "register_executed_buy",
+                    )
+                logging.warning(
+                    f"[register] {ticker}: рост исполнения заявки {order_id} "
+                    f"({baseline_before} -> {int(executed_lots)} лот.) после "
+                    f"синхронизации остатка снимком портфеля — к остатку НЕ "
+                    f"добавлен (исключено повторное применение после reconcile), "
+                    f"счётчики догнаны, quantity={existing.quantity}; "
+                    f"UNCERTAIN, новые BUY по {figi} заблокированы"
+                )
+                _save_state_checked(monitor, rm)
         elif existing.state == PositionState.OPEN:
             # Партия P0-2: поздние дополнительные лоты ПОСЛЕ перехода в OPEN
             # (например, отчёт брокера обновился после терминального CANCELLED).
             applied = monitor.apply_late_entry_lots(existing, executed_lots, order_id)
         if ledger is not None and order_id:
             rec = ledger.latest(order_id)
-            if applied:
+            if applied and not snapshot_covered_growth:
                 ledger.record_status(
                     order_id, ledger_status, executed_lots=executed_lots,
                     avg_exec_price=exec_price,
@@ -1081,9 +1151,10 @@ async def register_executed_buy(
                         f"Цена входа: {existing.entry_price:.4f} (не менялась)\n"
                         f"SL: {existing.sl_price:.4f}\nTP: {existing.tp_price:.4f} — сохранены"
                     )
-            elif contradiction:
+            elif contradiction or snapshot_covered_growth:
                 # Реестр уже переведён в UNCERTAIN выше — перезапись запрещена:
-                # противоречие должно оставаться видимым до разрешения.
+                # противоречие/неоднозначность должны оставаться видимыми
+                # до разрешения.
                 pass
             elif rec is not None and rec["status"] not in _TERMINAL_ORDER_STATUSES:
                 ledger.record_status(
@@ -1525,6 +1596,13 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
     Позиция БЕЗ order_id (адоптированная из reconcile/старта) остаётся в
     RECOVERY под контролем оператора: цена не заменяется произвольной,
     автоматическое закрытие ЗАПРЕЩЕНО.
+
+    Партия P0-4: рост lots_executed ПОСЛЕ достоверной синхронизации остатка
+    снимком портфеля (entry_snapshot_synced) — неоднозначен: дельта к
+    остатку не добавляется (снимок мог уже учесть исполнение), счётчики
+    догоняются по отчёту заявки, промоция ОТКЛАДЫВАЕТСЯ до сверки —
+    RECOVERY -> OPEN выполняется только с остатком, подтверждённым
+    достоверным снимком брокерского портфеля.
     """
     for pos in list(monitor.positions.values()):
         if pos.state != PositionState.RECOVERY:
@@ -1578,6 +1656,10 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
         # заявки): счётчики исполнения обновляются, дельта новых лотов
         # добавляется к остатку. Устаревший меньший lots_executed —
         # противоречие: количество НЕ уменьшается, промоция откладывается.
+        # Партия P0-4: рост ПОСЛЕ достоверной синхронизации остатка снимком
+        # (entry_snapshot_synced) — неоднозначен: дельта к остатку НЕ
+        # добавляется (снимок мог уже учесть исполнение), промоция
+        # откладывается до сверки.
         if broker_le > 0:
             seen = None
             rec = ledger.latest(pos.entry_order_id) if ledger is not None else None
@@ -1608,11 +1690,38 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
                         source="promote_recovery",
                     )
                 continue
+            snapshot_covered_growth = (
+                bool(pos.entry_snapshot_synced) and broker_le > baseline
+            )
             if monitor.record_recovery_entry_lots(
                     pos, broker_le, order_id=pos.entry_order_id,
                     already_seen_lots=seen):
                 # Изменение позиции/счётчиков сохраняется немедленно (D6)
                 _save_state_checked(monitor, rm)
+            if snapshot_covered_growth:
+                # Партия P0-4: дельта к остатку НЕ добавлена (снимок мог уже
+                # учесть это исполнение), счётчики догнаны по отчёту заявки.
+                # Промоция ОТКЛАДЫВАЕТСЯ до сверки: RECOVERY -> OPEN выполняется
+                # только с остатком, подтверждённым достоверным снимком.
+                # Неопределённость — существующей архитектурой.
+                client.uncertain_state = True
+                if ledger is not None:
+                    ledger.record_uncertain(
+                        pos.entry_order_id, trade_id=pos.trade_id,
+                        figi=pos.figi, ticker=pos.ticker, side="BUY",
+                        executed_lots=broker_le,
+                        reason=(f"рост lots_executed={broker_le} сверх учтённых "
+                                f"{baseline} после достоверной синхронизации остатка "
+                                f"по снимку портфеля — промоция отложена до сверки"),
+                        source="promote_recovery",
+                    )
+                logging.warning(
+                    f"[recovery] {pos.ticker}: рост исполнения заявки "
+                    f"{pos.entry_order_id} ({baseline} -> {broker_le} лот.) после "
+                    f"синхронизации остатка снимком портфеля — промоция "
+                    f"отложена до сверки (quantity={pos.quantity} сохранён)"
+                )
+                continue
 
         le = broker_le or pos.executed_lots or pos.quantity
         exec_price = ExecutionMonitor._extract_price(state, le, pos.lot_size)

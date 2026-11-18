@@ -31,6 +31,12 @@
 #       test_p03_2_stale_buy_report_contradiction_blocks_buy       (Тест 2)
 #       test_p03_3_reliable_snapshot_can_decrease_position         (Тест 3)
 #
+#   Партия P0-4 (гонка reconcile() -> poll_open_orders() в RECOVERY):
+#   Дефект «позднее исполнение, уже отражённое в достоверном снимке
+#       портфеля, повторно прибавлялось к остатку (7 -> 9 вместо 7)»:
+#       test_p04_reconcile_before_poll_no_reapply_of_late_lots           (интеграционный)
+#       test_p04_growth_report_after_snapshot_sync_not_added_to_quantity (юнит)
+#
 # Тесты проверяют ПОСЛЕДСТВИЯ: появилось ли количество в позиции, изменились
 # ли SL/TP, создан ли дубликат, заблокированы ли новые BUY, запустилась ли
 # повторная сверка, не «воскрешена» ли закрытая позиция.
@@ -561,4 +567,145 @@ def test_p03_3_reliable_snapshot_can_decrease_position(env):
     pos2 = monitor2.get_position(FIGI)
     assert pos2 is not None and pos2.state == PositionState.RECOVERY
     assert pos2.quantity == 7
+    assert pos2.entry_applied_lots == 8 and pos2.executed_lots == 8
+
+
+# ============================================================
+# Партия P0-4: гонка reconcile() -> poll_open_orders() в RECOVERY.
+# Позднее исполнение, уже отражённое в достоверном снимке портфеля,
+# не должно повторно прибавляться к остатку.
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_p04_reconcile_before_poll_no_reapply_of_late_lots(env):
+    """P0-4, воспроизводимый сценарий постановки (§2).
+
+    Исходное состояние RECOVERY: quantity=8, entry_applied_lots=8,
+    executed_lots=8, в реестре исполнение 8 лотов. Далее:
+      1) оператор вручную продаёт 3 лота, затем по отменённой BUY-заявке
+         приходит позднее исполнение ещё 2 лотов: у брокера остаток 7,
+         накопительное исполнение заявки — 10;
+      2) в одном торговом цикле reconcile() выполняется РАНЬШЕ
+         poll_open_orders(): сверка получает остаток 7 и обновляет RECOVERY;
+      3) затем poll_open_orders() получает lots_executed=10.
+
+    ОБЯЗАТЕЛЬНОЕ утверждение: локальный quantity == 7, а НЕ 9 — позднее
+    исполнение уже отражено в брокерском остатке, повторно прибавлять
+    его нельзя. Дополнительно: старое накопительное исполнение не
+    восстанавливает проданные лоты; счётчики исполнения заявки догоняются
+    по отчёту заявки; неоднозначность фиксируется существующей
+    архитектурой (uncertain_state + UNCERTAIN в реестре, новые BUY по
+    FIGI блокированы); повторный опрос того же ордера не меняет остаток;
+    контрольная сверка подтверждает остаток."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    oid = "oid-p04-race"
+    ledger.record_intent(oid, trade_id="t-p04", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=10)
+    monitor = ExecutionMonitor(client)
+
+    # --- Фаза 1: RECOVERY 8/8/8 (исполнение ДО ручной продажи) ---
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=8, price_units=800)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    pos = monitor.get_position(FIGI)
+    assert pos is not None and pos.state == PositionState.RECOVERY
+    assert pos.quantity == 8
+    assert pos.entry_applied_lots == 8 and pos.executed_lots == 8
+    rec = ledger.latest(oid)
+    assert rec["status"] == "CANCELLED" and rec["executed_lots"] == 8
+
+    # --- Фаза 2: ручная продажа 3 лотов + позднее исполнение 2 лотов —
+    # у брокера остаток 7 (уже включает поздние лоты). reconcile()
+    # выполняется РАНЬШЕ poll_open_orders() ---
+    client.positions_value = {FIGI: PositionData(lots=7, direction="LONG",
+                                                 raw_shares=Decimal(7))}
+    await main.reconcile(client, monitor, ledger, FakeRM())
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "достоверный снимок портфеля обязан управлять остатком"
+    assert pos.entry_applied_lots == 8 and pos.executed_lots == 8, \
+        "счётчики накопительного исполнения подменены остатком"
+
+    # --- Фаза 3: poll_open_orders() получает lots_executed=10 той же заявки ---
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=10, price_units=1000)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+
+    # ОБЯЗАТЕЛЬНОЕ утверждение постановки: quantity == 7, а не 9
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, \
+        f"позднее исполнение, уже учтённое снимком, повторно прибавлено: {pos.quantity}"
+    # накопительное исполнение заявки учтено в счётчиках (не в остатке)
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    # защитное поведение существующей архитектурой: неопределённость + блокировка
+    assert client.uncertain_state is True, "неоднозначность не зафиксирована"
+    assert ledger.figi_blocks_buy(FIGI) is True, "новые BUY по FIGI не заблокированы"
+    assert ledger.latest(oid)["status"] == "UNCERTAIN"
+    assert len(active_positions(monitor)) == 1, "дубликат позиции"
+
+    # --- Фаза 4: повторный опрос того же ордера не меняет остаток ---
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "повторный опрос изменил остаток"
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    assert len(active_positions(monitor)) == 1
+
+    # --- Фаза 5: контрольная сверка — остаток подтверждается снимком брокера,
+    # неопределённость разрешена, проданные лоты не восстановлены ---
+    await main.reconcile(client, monitor, ledger, FakeRM())
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "контрольная сверка изменила остаток"
+    assert pos.state == PositionState.RECOVERY
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    assert client.uncertain_state is False, "неопределённость не разрешена сверкой"
+
+
+def test_p04_growth_report_after_snapshot_sync_not_added_to_quantity():
+    """P0-4, юнит: после ДОСТОВЕРНОЙ синхронизации остатка снимком портфеля
+    рост накопительного lots_executed той же BUY-заявки НЕ добавляется к
+    остатку (снимок мог уже учесть это исполнение): quantity сохраняется,
+    счётчики исполнения догоняются по отчёту заявки; повторный отчёт с тем
+    же значением — no-op. Без снимка (контроль) рост применяется как прежде
+    — только действительно новые лоты."""
+    client = FakeClient()
+    monitor = ExecutionMonitor(client)
+    pos = monitor.register_recovery(figi=FIGI, ticker=TICKER, direction="BUY",
+                                    quantity=8, lot_size=1, order_id="oid-p04-unit",
+                                    recovery_source="no_price")
+    assert pos.quantity == 8 and pos.entry_applied_lots == 8
+    assert pos.entry_snapshot_synced is False
+
+    # достоверный снимок портфеля: остаток 7 (продан 1 лот; снимок мог уже
+    # включить и позднее исполнение)
+    assert monitor.sync_recovery_quantity(pos, 7) is True
+    assert pos.quantity == 7
+    assert pos.entry_applied_lots == 8 and pos.executed_lots == 8
+    assert pos.entry_snapshot_synced is True, "маркер покрытия снимком не выставлен"
+
+    # рост отчёта заявки 8 -> 10 ПОСЛЕ снимка: дельта к остатку НЕ добавляется
+    assert monitor.record_recovery_entry_lots(
+        pos, 10, order_id="oid-p04-unit", already_seen_lots=8) is True
+    assert pos.quantity == 7, "дельта прибавлена к остатку после снимка (повторный учёт)"
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10, \
+        "счётчики накопительного исполнения заявки не догнаны по отчёту"
+
+    # повторный отчёт с тем же значением — no-op
+    assert monitor.record_recovery_entry_lots(
+        pos, 10, order_id="oid-p04-unit", already_seen_lots=10) is False
+    assert pos.quantity == 7
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+
+    # устаревший ответ (меньше виденного) — противоречие, без изменений
+    assert monitor.record_recovery_entry_lots(
+        pos, 9, order_id="oid-p04-unit", already_seen_lots=10) is False
+    assert pos.quantity == 7
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+
+    # КОНТРОЛЬ: без достоверного снимка рост применяется как прежде (дельта)
+    monitor2 = ExecutionMonitor(client)
+    pos2 = monitor2.register_recovery(figi=FIGI, ticker=TICKER, direction="BUY",
+                                      quantity=3, lot_size=1, order_id="oid-p04-unit2",
+                                      recovery_source="no_price")
+    assert pos2.entry_snapshot_synced is False
+    assert monitor2.record_recovery_entry_lots(
+        pos2, 8, order_id="oid-p04-unit2", already_seen_lots=3) is True
+    assert pos2.quantity == 8, "без снимка рост исполнения должен применяться к остатку"
     assert pos2.entry_applied_lots == 8 and pos2.executed_lots == 8
