@@ -756,3 +756,39 @@ class ExecutionMonitor:
                     f"{type(e).__name__}: {e}"
                 )
         self.monitoring_error = bool(data.get("monitoring_error", False))
+def record_recovery_entry_lots(
+    self, pos: TrackedPosition, executed_lots: int
+) -> bool:
+    """Обновляет накопленное исполнение BUY, не меняя текущий остаток."""
+    if pos.state != PositionState.RECOVERY:
+        return False
+
+    try:
+        lots = int(executed_lots)
+    except (TypeError, ValueError):
+        return False
+
+    if lots < 0:
+        return False
+
+    previous = int(pos.entry_applied_lots or 0)
+
+    if lots < previous:
+        logging.error(
+            f"[execution] {pos.ticker}: противоречие исполнения "
+            f"{lots} < {previous}; quantity не изменяется"
+        )
+        return False
+
+    if lots == previous:
+        return False
+
+    pos.entry_applied_lots = lots
+    pos.executed_lots = lots
+
+    logging.warning(
+        f"[execution] {pos.ticker}: накопленное исполнение BUY "
+        f"обновлено {previous} -> {lots}; "
+        f"текущий остаток quantity={pos.quantity} НЕ изменён"
+    )
+    return True
