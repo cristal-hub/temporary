@@ -37,6 +37,16 @@
 #       test_p04_reconcile_before_poll_no_reapply_of_late_lots           (интеграционный)
 #       test_p04_growth_report_after_snapshot_sync_not_added_to_quantity (юнит)
 #
+#   Партия P0-5 (недопущение снятия UNCERTAIN повторным опросом):
+#   Дефект «повторный опрос с тем же lots_executed перезаписывал
+#       UNCERTAIN-запись реестра терминальным статусом (CANCELLED/EXPIRED/
+#       FILL) и снимал блокировку новых BUY по FIGI до подтверждённой
+#       сверки портфеля»:
+#       test_p05_1_first_ambiguous_growth_sets_uncertain
+#       test_p05_2_repeated_same_lots_poll_keeps_uncertain
+#       test_p05_3_failed_or_contradictory_reconcile_keeps_uncertain
+#       test_p05_4_successful_reconcile_allows_resolution_no_side_effects
+#
 # Тесты проверяют ПОСЛЕДСТВИЯ: появилось ли количество в позиции, изменились
 # ли SL/TP, создан ли дубликат, заблокированы ли новые BUY, запустилась ли
 # повторная сверка, не «воскрешена» ли закрытая позиция.
@@ -709,3 +719,208 @@ def test_p04_growth_report_after_snapshot_sync_not_added_to_quantity():
         pos2, 8, order_id="oid-p04-unit2", already_seen_lots=3) is True
     assert pos2.quantity == 8, "без снимка рост исполнения должен применяться к остатку"
     assert pos2.entry_applied_lots == 8 and pos2.executed_lots == 8
+
+
+# ============================================================
+# Партия P0-5: недопущение снятия UNCERTAIN повторным опросом.
+# После неоднозначного роста lots_executed заявка в реестре UNCERTAIN;
+# повторный отчёт с тем же значением не должен перезаписывать её
+# терминальным статусом (CANCELLED/EXPIRED/FILL) и снимать блокировку
+# новых BUY по FIGI до подтверждённой сверки портфеля.
+# ============================================================
+
+async def _p05_setup_ambiguity(env, monkeypatch, oid="oid-p05"):
+    """Общая подготовка сценария P0-5:
+      фаза 1: исполнение 8 лотов без свечей -> RECOVERY 8/8/8;
+      фаза 2: достоверная сверка портфеля: остаток 7 (снимок мог уже
+              включать поздние лоты) — маркер подтверждённой сверки
+              выставляется ДО появления UNCERTAIN;
+      фаза 3: неоднозначный рост lots_executed 8 -> 10 ПОСЛЕ достоверной
+              синхронизации остатка снимком -> UNCERTAIN-запись реестра,
+              FIGI заблокирован, quantity остаётся 7.
+    Возвращает (ledger, client, monitor, oid)."""
+    # raising=False: маркер существует только в коде с фиксом P0-5 — на коде
+    # без фикса атрибут создаётся как None (демонстрация дефекта честная:
+    # падают только тесты, проверяющие перезапись UNCERTAIN).
+    monkeypatch.setattr(main, "_last_reconcile_confirmed_utc", None, raising=False)
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    ledger.record_intent(oid, trade_id="t-p05", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=10)
+    monitor = ExecutionMonitor(client)
+
+    # фаза 1: RECOVERY 8/8/8
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=8, price_units=800)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    pos = monitor.get_position(FIGI)
+    assert pos is not None and pos.state == PositionState.RECOVERY
+    assert pos.quantity == 8 and pos.entry_applied_lots == 8 and pos.executed_lots == 8
+
+    # фаза 2: достоверная сверка: остаток 7
+    client.positions_value = {FIGI: PositionData(lots=7, direction="LONG",
+                                                 raw_shares=Decimal(7))}
+    await main.reconcile(client, monitor, ledger, FakeRM())
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "достоверный снимок обязан управлять остатком"
+    assert pos.entry_applied_lots == 8 and pos.executed_lots == 8
+    assert pos.entry_snapshot_synced is True, "маркер покрытия снимком не выставлен"
+
+    # фаза 3: неоднозначный рост 8 -> 10 ПОСЛЕ снимка -> UNCERTAIN
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=10, price_units=1000)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "дельта прибавлена к остатку (дефект партии P0-4)"
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    assert client.uncertain_state is True, "неоднозначный рост не зафиксирован"
+    rec = ledger.latest(oid)
+    assert rec["status"] == "UNCERTAIN", \
+        f"первый неоднозначный рост не перевёл заявку в UNCERTAIN: {rec['status']}"
+    assert rec["executed_lots"] == 10
+    assert ledger.figi_blocks_buy(FIGI) is True, "новые BUY по FIGI не заблокированы"
+    assert len(active_positions(monitor)) == 1
+    return ledger, client, monitor, oid
+
+
+@pytest.mark.asyncio
+async def test_p05_1_first_ambiguous_growth_sets_uncertain(env, monkeypatch):
+    """P0-5 (1). Первый неоднозначный рост lots_executed ПОСЛЕ достоверной
+    синхронизации остатка снимком портфеля переводит заявку в UNCERTAIN:
+    client.uncertain_state=True, UNCERTAIN-запись реестра, блокировка новых
+    BUY по FIGI; дельта к остатку не добавлена (защита партии P0-4)."""
+    ledger, client, monitor, oid = await _p05_setup_ambiguity(env, monkeypatch)
+    rec = ledger.latest(oid)
+    assert rec["status"] == "UNCERTAIN"
+    assert client.uncertain_state is True
+    assert ledger.figi_blocks_buy(FIGI) is True
+    pos = monitor.get_position(FIGI)
+    assert pos.state == PositionState.RECOVERY
+    assert pos.quantity == 7
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+
+
+@pytest.mark.asyncio
+async def test_p05_2_repeated_same_lots_poll_keeps_uncertain(env, monkeypatch):
+    """P0-5 (2)+(3). Повторный опрос с тем же lots_executed (терминальный
+    статус брокера CANCELLED) НЕ снимает ранее установленную UNCERTAIN:
+    запись реестра сохраняется (в том числе время последнего перехода),
+    терминальный статус НЕ пишется, блокировка новых BUY по FIGI остаётся,
+    количество позиции и счётчики не меняются, дубликата нет."""
+    ledger, client, monitor, oid = await _p05_setup_ambiguity(env, monkeypatch)
+    before = ledger.latest(oid)
+    assert before["status"] == "UNCERTAIN"
+
+    # повторный опрос с тем же значением lots_executed
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=10, price_units=1000)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+
+    rec = ledger.latest(oid)
+    assert rec["status"] == "UNCERTAIN", \
+        f"повторный терминальный отчёт снял UNCERTAIN: {rec['status']}"
+    assert rec["updated_at_utc"] == before["updated_at_utc"], \
+        "повторный отчёт перезаписал UNCERTAIN-запись реестра"
+    assert ledger.figi_blocks_buy(FIGI) is True, \
+        "блокировка FIGI снята повторным терминальным статусом до сверки"
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "повторный отчёт изменил количество позиции"
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    assert len(active_positions(monitor)) == 1, "дубликат позиции"
+    assert client.uncertain_state is True, \
+        "неопределённость снята повторным отчётом без сверки"
+
+    # и третий опрос с тем же значением — результат тот же (стабильность)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    rec = ledger.latest(oid)
+    assert rec["status"] == "UNCERTAIN"
+    assert rec["updated_at_utc"] == before["updated_at_utc"]
+    assert monitor.get_position(FIGI).quantity == 7
+
+
+@pytest.mark.asyncio
+async def test_p05_3_failed_or_contradictory_reconcile_keeps_uncertain(env, monkeypatch):
+    """P0-5 (4)+(5). Ошибка reconcile() (недоступный снимок = None) и
+    противоречивый снимок (расхождение направлений) НЕ разрешают
+    неопределённость: маркер подтверждённой сверки не выставляется,
+    UNCERTAIN сохраняется, блокировка FIGI не снимается."""
+    ledger, client, monitor, oid = await _p05_setup_ambiguity(env, monkeypatch)
+    marker_after_setup = main._last_reconcile_confirmed_utc
+    assert marker_after_setup is not None, \
+        "успешная сверка подготовки не выставила маркер подтверждённой сверки"
+
+    # ошибка: снимок портфеля недоступен (None) — учёт не меняется
+    client.positions_value = None
+    await main.reconcile(client, monitor, ledger, FakeRM())
+    assert client.uncertain_state is True, "ошибка сверка сняла неопределённость"
+    assert main._last_reconcile_confirmed_utc == marker_after_setup, \
+        "ошибка сверка выставила маркер подтверждённого разрешения"
+
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=10, price_units=1000)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    assert ledger.latest(oid)["status"] == "UNCERTAIN", \
+        "ошибка сверка разрешила снятие UNCERTAIN повторным опросом"
+    assert ledger.figi_blocks_buy(FIGI) is True
+
+    # противоречивый снимок: направление брокера SHORT при локальном LONG
+    client.positions_value = {FIGI: PositionData(lots=-7, direction="SHORT",
+                                                 raw_shares=Decimal(-7))}
+    await main.reconcile(client, monitor, ledger, FakeRM())
+    assert client.uncertain_state is True, "противоречивая сверка сняла неопределённость"
+    assert main._last_reconcile_confirmed_utc == marker_after_setup, \
+        "противоречивая сверка выставила маркер подтверждённого разрешения"
+
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    assert ledger.latest(oid)["status"] == "UNCERTAIN", \
+        "противоречивая сверка разрешила снятие UNCERTAIN повторным опросом"
+    assert ledger.figi_blocks_buy(FIGI) is True
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "количество изменено при неразрешённой неопределённости"
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    assert len(active_positions(monitor)) == 1
+
+
+@pytest.mark.asyncio
+async def test_p05_4_successful_reconcile_allows_resolution_no_side_effects(env, monkeypatch):
+    """P0-5 (5)+(6). Успешный reconcile() с подтверждённым остатком
+    позволяет штатно разрешить неопределённость: последующий повторный
+    опрос с тем же lots_executed закрывает UNCERTAIN-запись терминальным
+    статусом брокера и снимает блокировку FIGI; количество позиции не
+    меняется, дубликат позиции не создаётся, повторные опросы стабильны."""
+    ledger, client, monitor, oid = await _p05_setup_ambiguity(env, monkeypatch)
+
+    # успешная сверка с подтверждённым остатком (7 совпадает с локальным)
+    client.positions_value = {FIGI: PositionData(lots=7, direction="LONG",
+                                                 raw_shares=Decimal(7))}
+    await main.reconcile(client, monitor, ledger, FakeRM())
+    assert client.uncertain_state is False, "успешная сверка не сняла неопределённость"
+    assert main._last_reconcile_confirmed_utc is not None, \
+        "маркер подтверждённой сверки не выставлен"
+    pos = monitor.get_position(FIGI)
+    assert pos.quantity == 7, "контрольная сверка изменила остаток"
+    assert ledger.latest(oid)["status"] == "UNCERTAIN", \
+        "сверка не должна сама перезаписывать запись реестра"
+
+    # повторный опрос с тем же lots_executed — штатное разрешение
+    client.order_states[oid] = fake_state(CANCELLED, lots_executed=10, price_units=1000)
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+
+    rec = ledger.latest(oid)
+    assert rec["status"] == "CANCELLED", \
+        f"неопределённость не разрешена штатно после подтверждённой сверки: {rec['status']}"
+    assert rec["executed_lots"] == 10
+    assert ledger.figi_blocks_buy(FIGI) is False, \
+        "блокировка FIGI не снята после подтверждённого разрешения"
+    pos = monitor.get_position(FIGI)
+    assert pos.state == PositionState.RECOVERY
+    assert pos.quantity == 7, "разрешение изменило количество позиции"
+    assert pos.entry_applied_lots == 10 and pos.executed_lots == 10
+    assert len(active_positions(monitor)) == 1, "дубликат позиции при разрешении"
+    assert client.uncertain_state is False
+
+    # повторный опрос после разрешения — стабилен: статус и учёт не меняются
+    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+    rec2 = ledger.latest(oid)
+    assert rec2["status"] == "CANCELLED"
+    assert rec2["executed_lots"] == 10
+    pos2 = monitor.get_position(FIGI)
+    assert pos2.quantity == 7, "повторный опрос после разрешения изменил количество"
+    assert pos2.entry_applied_lots == 10 and pos2.executed_lots == 10
+    assert len(active_positions(monitor)) == 1, "дубликат позиции после разрешения"

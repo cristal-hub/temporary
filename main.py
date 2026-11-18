@@ -129,6 +129,34 @@
 #   - Порядок вызовов и остальные ветки жизненного цикла process_closing(),
 #     reconcile() и trading_cycle() не менялись.
 #
+# ИЗМЕНЕНИЯ (партия P0-5 — недопущение снятия UNCERTAIN повторным опросом):
+#   Дефект: после неоднозначного роста lots_executed заявка переводится в
+#   UNCERTAIN (реестр + client.uncertain_state). При ПОВТОРНОМ опросе с тем
+#   же значением lots_executed record_recovery_entry_lots() возвращает False
+#   и snapshot_covered_growth становится False — срабатывал общий блок
+#   идемпотентности register_executed_buy() и ledger.record_status() писал
+#   терминальный статус CANCELLED/EXPIRED/FILL ПОВЕРХ UNCERTAIN-записи:
+#   неопределённость снималась и блокировка новых BUY по FIGI отпускалась
+#   ДО подтверждённой сверки портфеля.
+#   - register_executed_buy(): обычный повторный отчёт с тем же
+#     lots_executed (состояние учёта не изменилось) НЕ перезаписывает
+#     действующую UNCERTAIN-запись и НЕ пишет терминальный статус;
+#     UNCERTAIN сохраняется в реестре до успешного разрешения;
+#     то же — для ветки реально применённого позднего исполнения при
+#     действующей UNCERTAIN (исполнение применяется, терминальный статус
+#     не пишется до сверки).
+#   - reconcile(): УСПЕШНАЯ сверка (достоверный снимок портфеля, без
+#     расхождений) выставляет маркер _last_reconcile_confirmed_utc —
+#     «подтверждённое безопасное разрешение» неопределённостей, появившихся
+#     ДО этого момента. Только после него повторный терминальный отчёт
+#     заявки, совпадающий с учтённым исполнением, штатно закрывает
+#     UNCERTAIN-запись и снимает блокировку FIGI. Ошибка/расхождение
+#     сверки маркер НЕ выставляют — защита не ослабляется при
+#     противоречивом или недоступном снимке портфеля.
+#   - Количество позиции повторным отчётом не меняется (record_recovery_
+#     entry_lots при том же значении — no-op); стратегия, сигналы, риск-
+#     модель и правила открытия не затронуты.
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   _load_state, resolve_closing/resolve_uncertain (execution.py — см. его
@@ -152,7 +180,7 @@ from t_tech.invest import (
 
 import config
 import logger as research_logger
-from order_ledger import OrderLedger
+from order_ledger import OrderLedger, STATUS_UNCERTAIN, utc_now_iso
 from risk_manager import RiskManager
 from strategy import StrategyManager
 from tinkoff_client import TinkoffClient, PositionData
@@ -220,6 +248,36 @@ def _age_in_cycles(rec) -> float:
         return 0.0
 
 
+def _uncertainty_resolved_by_reconcile(rec: dict) -> bool:
+    """
+    Партия P0-5: разрешена ли UNCERTAIN-запись заявки ПОДТВЕРЖДЁННОЙ сверкой.
+
+    True ТОЛЬКО если после появления UNCERTAIN-записи (updated_at_utc) был
+    успешный reconcile(): достоверный снимок портфеля без расхождений
+    (маркер _last_reconcile_confirmed_utc). Такая сверка подтверждает
+    фактический остаток у брокера, после чего повторный терминальный отчёт
+    заявки, совпадающий с учтённым исполнением, штатно закрывает запись и
+    снимает блокировку новых BUY по FIGI.
+
+    Любая НОВАЯ UNCERTAIN-запись, появившаяся ПОСЛЕ последней успешной
+    сверки (updated_at_utc больше маркера), считается неразрешённой —
+    повторные отчёты её не снимают. Ошибка/противоречие сверки маркер
+    не выставляют; неразборчивые/несравнимые метки времени трактуются
+    консервативно (не разрешена).
+    """
+    if _last_reconcile_confirmed_utc is None:
+        return False
+    rec_ts = rec.get("updated_at_utc") or rec.get("timestamp_utc")
+    if not rec_ts:
+        return False
+    try:
+        rec_dt = datetime.fromisoformat(str(rec_ts))
+        mark_dt = datetime.fromisoformat(str(_last_reconcile_confirmed_utc))
+        return rec_dt <= mark_dt
+    except (TypeError, ValueError):
+        return False
+
+
 top_instruments = []
 telegram_bot = None
 main_client = None
@@ -230,6 +288,14 @@ rm_ref = None
 # Этап 5: реестр заявок и флаг ошибки сохранения state.json
 ledger_ref = None
 state_save_failed = False
+
+# Партия P0-5: UTC-момент последней УСПЕШНОЙ сверки reconcile() (достоверный
+# снимок портфеля, без расхождений) — маркер «подтверждённого безопасного
+# разрешения» неопределённостей реестра, появившихся до этого момента.
+# None — подтверждённой сверки ещё не было: UNCERTAIN-записи не разрешаются
+# повторными отчётами (блокировки сохраняются). Выставляется ТОЛЬКО в
+# reconcile() при полном успехе; ошибки/расхождения маркер не трогают.
+_last_reconcile_confirmed_utc = None
 
 _strategy_event_keys = set()
 _promote_throttle = {"n": 0, "alive": 0}
@@ -551,8 +617,14 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor,
         входа нет).
       - Количество RECOVERY-позиции синхронизируется с брокером; направление
         не меняется. OPEN/CLOSING/UNCERTAIN — прежние правила.
+
+    Партия P0-5: при ПОЛНОМ успехе (достоверный снимок, без расхождений)
+    выставляется маркер _last_reconcile_confirmed_utc — подтверждённое
+    безопасное разрешение неопределённостей реестра, появившихся ДО этого
+    момента (см. _uncertainty_resolved_by_reconcile). Ошибка снимка или
+    расхождения маркер НЕ выставляют.
     """
-    global reconcile_done
+    global reconcile_done, _last_reconcile_confirmed_utc
     positions = await client.get_positions()
 
     if positions is None:
@@ -665,6 +737,12 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor,
 
     reconcile_done = True
     client.uncertain_state = False
+    # Партия P0-5: успешная сверка (достоверный снимок портфеля, без
+    # расхождений) — подтверждённое безопасное разрешение неопределённостей
+    # реестра, появившихся до этого момента. Только после него повторный
+    # терминальный отчёт заявки, совпадающий с учтённым исполнением,
+    # штатно закрывает UNCERTAIN-запись (см. register_executed_buy).
+    _last_reconcile_confirmed_utc = utc_now_iso()
     research_logger.log_event("RECONCILE_OK", {"positions": len(local)})
 
 
@@ -1125,37 +1203,90 @@ async def register_executed_buy(
             applied = monitor.apply_late_entry_lots(existing, executed_lots, order_id)
         if ledger is not None and order_id:
             rec = ledger.latest(order_id)
+            # Партия P0-5: действующая (ещё не разрешённая подтверждённой
+            # сверкой портфеля) UNCERTAIN-запись заявки. Обычный повторный
+            # отчёт брокера (тот же lots_executed, состояние учёта не
+            # изменилось) НЕ снимает её и НЕ перезаписывает терминальным
+            # статусом: блокировка новых BUY по FIGI сохраняется до
+            # подтверждённого безопасного разрешения — успешного reconcile
+            # по достоверному снимку портфеля ПОСЛЕ появления UNCERTAIN.
+            uncertainty_pending = (
+                rec is not None
+                and rec["status"] == STATUS_UNCERTAIN
+                and not _uncertainty_resolved_by_reconcile(rec)
+            )
             if applied and not snapshot_covered_growth:
-                ledger.record_status(
-                    order_id, ledger_status, executed_lots=executed_lots,
-                    avg_exec_price=exec_price,
-                    reason=f"позднее исполнение применено к позиции "
-                           f"(+{existing.quantity - qty_before} лот., итого {existing.quantity})",
-                    source=source or "register_executed_buy",
-                )
-                _save_state_checked(monitor, rm)
-                research_logger.log_event("POSITION_ENTRY_LATE_FILL", {
-                    "figi": figi, "ticker": ticker, "order_id": order_id,
-                    "added_lots": existing.quantity - qty_before,
-                    "quantity": existing.quantity,
-                    "state": existing.state.value,
-                    "entry_price": existing.entry_price,
-                    "sl": existing.sl_price, "tp": existing.tp_price,
-                    "source": source,
-                })
-                if existing.state == PositionState.OPEN:
-                    await notify(
-                        f"⚠️ <b>{ticker}</b>: позднее исполнение входной заявки\n"
-                        f"Добавлено лотов: +{existing.quantity - qty_before} "
-                        f"(итого {existing.quantity})\n"
-                        f"Цена входа: {existing.entry_price:.4f} (не менялась)\n"
-                        f"SL: {existing.sl_price:.4f}\nTP: {existing.tp_price:.4f} — сохранены"
+                if uncertainty_pending:
+                    # Партия P0-5: исполнение применено к позиции (реально
+                    # новые лоты, подтверждённые брокером), но действующая
+                    # UNCERTAIN-запись сохраняется до подтверждённой сверки:
+                    # терминальный статус не пишется, блокировка FIGI
+                    # остаётся. Изменения позиции сохраняются немедленно.
+                    logging.warning(
+                        f"[register] {ticker}: исполнение заявки {order_id} "
+                        f"применено к позиции (+{existing.quantity - qty_before} лот.), "
+                        f"но действующая UNCERTAIN-запись сохранена до "
+                        f"подтверждённой сверки портфеля — терминальный статус "
+                        f"не пишется, новые BUY по {figi} остаются заблокированы"
                     )
+                    _save_state_checked(monitor, rm)
+                else:
+                    ledger.record_status(
+                        order_id, ledger_status, executed_lots=executed_lots,
+                        avg_exec_price=exec_price,
+                        reason=f"позднее исполнение применено к позиции "
+                               f"(+{existing.quantity - qty_before} лот., итого {existing.quantity})",
+                        source=source or "register_executed_buy",
+                    )
+                    _save_state_checked(monitor, rm)
+                    research_logger.log_event("POSITION_ENTRY_LATE_FILL", {
+                        "figi": figi, "ticker": ticker, "order_id": order_id,
+                        "added_lots": existing.quantity - qty_before,
+                        "quantity": existing.quantity,
+                        "state": existing.state.value,
+                        "entry_price": existing.entry_price,
+                        "sl": existing.sl_price, "tp": existing.tp_price,
+                        "source": source,
+                    })
+                    if existing.state == PositionState.OPEN:
+                        await notify(
+                            f"⚠️ <b>{ticker}</b>: позднее исполнение входной заявки\n"
+                            f"Добавлено лотов: +{existing.quantity - qty_before} "
+                            f"(итого {existing.quantity})\n"
+                            f"Цена входа: {existing.entry_price:.4f} (не менялась)\n"
+                            f"SL: {existing.sl_price:.4f}\nTP: {existing.tp_price:.4f} — сохранены"
+                        )
             elif contradiction or snapshot_covered_growth:
                 # Реестр уже переведён в UNCERTAIN выше — перезапись запрещена:
                 # противоречие/неоднозначность должны оставаться видимыми
                 # до разрешения.
                 pass
+            elif uncertainty_pending:
+                # Партия P0-5: повторный обычный отчёт с тем же lots_executed
+                # НЕ снимает ранее установленную UNCERTAIN и НЕ пишет
+                # терминальный статус: запись сохраняется до подтверждённой
+                # сверки портфеля, блокировка новых BUY по FIGI не отпускается
+                # простым повторным терминальным статусом заявки.
+                logging.warning(
+                    f"[register] {ticker}: повторный отчёт заявки {order_id} "
+                    f"(status={ledger_status}, lots_executed={executed_lots}) при "
+                    f"действующей UNCERTAIN-записи — запись сохранена, терминальный "
+                    f"статус не пишется; новые BUY по {figi} остаются заблокированы "
+                    f"до подтверждённой сверки портфеля"
+                )
+            elif rec is not None and rec["status"] == STATUS_UNCERTAIN:
+                # Партия P0-5: неопределённость разрешена подтверждённой
+                # сверкой портфеля (успешный reconcile ПОСЛЕ появления
+                # UNCERTAIN) — штатное закрытие записи повторным терминальным
+                # отчётом брокера, совпадающим с учтённым исполнением.
+                ledger.record_status(
+                    order_id, ledger_status, executed_lots=executed_lots,
+                    avg_exec_price=exec_price,
+                    reason=("неопределённость разрешена подтверждённой сверкой "
+                            "портфеля; повторный терминальный отчёт совпадает "
+                            "с учтённым исполнением — идемпотентность"),
+                    source=source or "register_executed_buy",
+                )
             elif rec is not None and rec["status"] not in _TERMINAL_ORDER_STATUSES:
                 ledger.record_status(
                     order_id, ledger_status, executed_lots=executed_lots,
