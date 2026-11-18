@@ -42,6 +42,8 @@
 #     входа и расчёте SL/TP (расчёт SL/TP — через стратегию, без изменений).
 #   - sync_recovery_quantity() — синхронизация количества RECOVERY-позиции
 #     с ДОСТОВЕРНЫМ снимком брокера (адопция, направление не меняется).
+#     (партия P0-3: управляет ТОЛЬКО остатком; счётчики BUY-исполнения
+#     не подменяются остатком — см. record_recovery_entry_lots).
 #   - check_all(): RECOVERY-позиции пропускаются без SL/TP-решений (SL/TP ещё
 #     не заданы), monitoring_error для них не ставится.
 #
@@ -68,6 +70,37 @@
 #   автоматических изменений (сверка/оператор); RECOVERY — через
 #   sync_recovery_quantity().
 #   has_active_position, active_count, имена остальных полей TrackedPosition.
+#
+# ИЗМЕНЕНИЯ (партия P0-3 — разделение «остаток позиции» и «исполнение заявки»):
+#   Дефект: sync_recovery_quantity() использовалась для ДВУХ РАЗНЫХ величин:
+#     (А) актуализация остатка позиции по ДОСТОВЕРНОМУ снимку брокерского
+#         портфеля и (Б) повторная обработка накопительного lots_executed
+#         старой BUY-заявки. lots_executed — накопительное исполнение
+#         КОНКРЕТНОЙ заявки; pos.quantity — текущий остаток позиции у брокера.
+#         Они расходятся, если оператор вручную продал/докупил лоты. Повторный
+#         ответ старой BUY-заявки НЕ должен восстанавливать проданные лоты,
+#         а устаревший ответ с меньшим lots_executed НЕ должен уменьшать
+#         позицию.
+#   - sync_recovery_quantity() — ТОЛЬКО достоверный снимок брокерского
+#     портфеля: quantity := abs(broker_lots), увеличение И уменьшение
+#     разрешены (функция НЕ монотонна). Накопительные счётчики BUY-исполнения
+#     (entry_applied_lots/executed_lots) при уменьшении остатка НЕ изменяются
+#     (не подменяются остатком позиции); при увеличении — увеличиваются до
+#     нового значения (новые исполненные лоты учтены локально).
+#   - record_recovery_entry_lots() — НОВЫЙ метод класса: повторная обработка
+#     накопительного lots_executed BUY-заявки для RECOVERY-позиции. Сравнение
+#     с уже учтённым исполнением (entry_applied_lots) и с уже виденным у этой
+#     же заявки значением (already_seen_lots из реестра заявок):
+#       рост — к quantity добавляется ТОЛЬКО дельта действительно новых лотов,
+#         счётчики исполнения обновляются;
+#       равенство — ничего не меняется (повторный ответ);
+#       уменьшение — противоречие/устаревший ответ: quantity и счётчики
+#         не изменяются (неопределённость и блокировку новых BUY выставляет
+#         вызывающий код main.py существующей архитектурой).
+#     Связь заявки с позицией проверяется по entry_order_id; исполнение
+#     чужой заявки не применяется. Только RECOVERY, только BUY.
+#   - Оборванный черновик record_recovery_entry_lots на уровне модуля
+#     (вне класса, никем не вызывался) заменён полноценным методом класса.
 
 import logging
 from dataclasses import dataclass, field, asdict
@@ -321,13 +354,23 @@ class ExecutionMonitor:
         Знак брокерского значения (SHORT отрицателен) в pos.quantity
         НЕ переносится; двойного применения знака нет ни в синхронизации,
         ни в расчётах, ни при закрытии.
-        Правила:
+        Правила (партия P0-3 — разделение величин):
           - broker_lots == 0 — синхронизация НЕ выполняется, RECOVERY
             НЕ закрывается автоматически (решение — оператор/reconcile);
           - знак broker_lots противоречит направлению (LONG ожидает > 0,
             SHORT ожидает < 0) — синхронизация НЕ выполняется,
             расхождение отдаётся оператору;
-          - quantity/executed_lots/entry_applied_lots = abs(broker_lots).
+          - pos.quantity = abs(broker_lots) — И увеличение, И уменьшение
+            разрешены: достоверный снимок портфеля управляет текущим
+            остатком (оператор мог продать часть позиции); функция
+            НЕ делается монотонной;
+          - накопительные счётчики BUY-исполнения
+            (entry_applied_lots/executed_lots) при УМЕНЬШЕНИИ остатка
+            НЕ изменяются (не подменяются остатком позиции: исполненные
+            входные лоты не убывают); при УВЕЛИЧЕНИИ остатка — увеличиваются
+            до abs(broker_lots) (новые исполненные лоты теперь учтены).
+        НЕ используется для обработки lots_executed конкретной заявки —
+        для этого существует record_recovery_entry_lots().
         """
         if pos.state != PositionState.RECOVERY:
             return False
@@ -356,15 +399,156 @@ class ExecutionMonitor:
         abs_lots = abs(lots)
         if abs_lots == pos.quantity:
             return False
+        applied = int(pos.entry_applied_lots or 0)
         side_word = "SHORT" if lots < 0 else "LONG"
+        if abs_lots < applied:
+            # Остаток у брокера меньше учтённого исполнения BUY — часть лотов
+            # продана (оператор/внешняя операция). Остаток следует достоверному
+            # снимку; накопительное исполнение BUY НЕ уменьшается и НЕ
+            # подменяется остатком позиции.
+            logging.info(
+                f"[execution] sync_recovery {pos.ticker}: lots брокера={lots} "
+                f"({side_word}) < учтённого исполнения BUY {applied} — "
+                f"остаток {pos.quantity} -> {abs_lots}, счётчики исполнения "
+                f"сохранены ({applied})"
+            )
+            pos.quantity = abs_lots
+            return True
         logging.info(
             f"[execution] sync_recovery {pos.ticker}: lots брокера={lots} "
             f"({side_word}), локально={pos.quantity} — "
             f"синхронизировано (каноническое количество {abs_lots})"
         )
         pos.quantity = abs_lots
-        pos.executed_lots = abs_lots
-        pos.entry_applied_lots = abs_lots
+        if abs_lots > applied:
+            # Рост остатка = новые исполненные BUY-лоты, теперь учтённые локально.
+            pos.executed_lots = abs_lots
+            pos.entry_applied_lots = abs_lots
+        return True
+
+    def record_recovery_entry_lots(
+        self, pos: TrackedPosition, executed_lots: int,
+        order_id: Optional[str] = None,
+        already_seen_lots: Optional[int] = None,
+    ) -> bool:
+        """
+        Партия P0-3: повторная обработка накопительного lots_executed
+        BUY-заявки для RECOVERY-позиции.
+
+        ОТЛИЧАЕТСЯ от sync_recovery_quantity():
+          sync_recovery_quantity — ДОСТОВЕРНЫЙ снимок брокерского портфеля:
+            управляет текущим остатком pos.quantity (в обе стороны);
+          record_recovery_entry_lots — накопительное исполнение КОНКРЕТНОЙ
+            BUY-заявки (lots_executed от брокера): управляет ТОЛЬКО учётом
+            исполненных входных лотов. lots_executed заявки и остаток позиции
+            у брокера — разные величины: повторный ответ старой заявки НЕ
+            восстанавливает проданные оператором лоты.
+
+        Правила:
+          - только RECOVERY-позиция направления BUY (входные заявки робота —
+            BUY; SHORT-RECOVERY остаётся под контролем оператора/сверки);
+          - связь заявки с позицией: order_id должен совпадать с
+            entry_order_id (если оба известны) — исполнение ЧУЖОЙ заявки
+            не применяется;
+          - база сравнения = max(entry_applied_lots, already_seen_lots):
+            учтённое накопительное исполнение этой заявки и значение, уже
+            виденное у неё в реестре. Разница (seen - applied), если она
+            есть, уже покрыта достоверной сверкой портфеля и повторно в
+            позицию НЕ добавляется (иначе восстанавливались бы проданные
+            лоты);
+          - le > базы: к quantity добавляется ТОЛЬКО дельта действительно
+            новых исполнений, счётчики (entry_applied_lots/executed_lots)
+            обновляются на le;
+          - le == базы: ничего не меняется (повторный ответ с тем же
+            значением); если при этом le > entry_applied_lots — догоняются
+            только счётчики (разрыв покрыт сверкой), quantity НЕ меняется;
+          - le < базы: противоречие/устаревший ответ — quantity и счётчики
+            НЕ изменяются (исполнение не убывает); неопределённость и
+            блокировку новых BUY выставляет вызывающий код main.py
+            существующей архитектурой (client.uncertain_state + реестр).
+        Возвращает True, если состояние позиции изменилось.
+        """
+        if pos.state != PositionState.RECOVERY:
+            logging.warning(
+                f"[execution] record_recovery_entry {pos.ticker}: состояние "
+                f"{pos.state.value} — обработка lots_executed входной заявки "
+                f"применима только к RECOVERY (OPEN — apply_late_entry_lots)"
+            )
+            return False
+        if pos.direction != "BUY":
+            logging.error(
+                f"[execution] record_recovery_entry {pos.ticker}: направление "
+                f"{pos.direction} — накопительное исполнение BUY-заявки "
+                f"неприменимо"
+            )
+            return False
+        if order_id and pos.entry_order_id and order_id != pos.entry_order_id:
+            logging.error(
+                f"[execution] record_recovery_entry {pos.ticker}: заявка "
+                f"{order_id} не совпадает с entry_order_id={pos.entry_order_id} "
+                f"— исполнение чужой заявки не применяется"
+            )
+            return False
+        try:
+            le = int(executed_lots)
+        except (TypeError, ValueError):
+            logging.error(
+                f"[execution] record_recovery_entry {pos.ticker}: некорректное "
+                f"executed_lots={executed_lots!r}"
+            )
+            return False
+        if le < 0:
+            logging.error(
+                f"[execution] record_recovery_entry {pos.ticker}: отрицательное "
+                f"executed_lots={le} — не накопительное исполнение BUY"
+            )
+            return False
+
+        applied = int(pos.entry_applied_lots or 0)
+        baseline = applied
+        if already_seen_lots is not None:
+            try:
+                seen = int(already_seen_lots)
+            except (TypeError, ValueError):
+                seen = 0
+            if seen > baseline:
+                baseline = seen
+
+        if le < baseline:
+            logging.error(
+                f"[execution] record_recovery_entry {pos.ticker}: "
+                f"lots_executed={le} < уже учтённых/виденных {baseline} "
+                f"(applied={applied}) — противоречие (исполнение не убывает); "
+                f"quantity={pos.quantity} и счётчики не изменены"
+            )
+            return False
+
+        if le == baseline:
+            if le == applied:
+                # Повторный ответ с тем же значением — ничего не менять.
+                return False
+            # le уже видился у этой заявки (seen), но в позицию учтено меньше:
+            # разрыв покрыт достоверной сверкой (проданные лоты НЕ
+            # восстанавливаются) — догоняются только счётчики исполнения.
+            pos.entry_applied_lots = le
+            pos.executed_lots = le
+            logging.warning(
+                f"[execution] record_recovery_entry {pos.ticker}: "
+                f"lots_executed={le} уже виден у заявки (учтено было "
+                f"{applied}) — счётчики исполнения догнаны, остаток "
+                f"quantity={pos.quantity} сохранён"
+            )
+            return True
+
+        delta = le - baseline
+        pos.quantity = pos.quantity + delta
+        pos.entry_applied_lots = le
+        pos.executed_lots = le
+        logging.warning(
+            f"[execution] record_recovery_entry {pos.ticker}: новые исполненные "
+            f"лоты входной BUY-заявки +{delta} (итого исполнено {le}) — "
+            f"quantity={pos.quantity}, счётчики обновлены"
+        )
         return True
 
     def apply_late_entry_lots(self, pos: TrackedPosition, executed_lots: int,
@@ -385,14 +569,19 @@ class ExecutionMonitor:
           - уменьшение противоречит неизменности исполнения — БЕЗ изменений,
             False (исполнение не убывает);
           - CLOSING/UNCERTAIN — БЕЗ автоматических изменений (решение —
-            сверка/оператор); RECOVERY синхронизируется sync_recovery_quantity().
+            сверка/оператор); RECOVERY обрабатывается
+            record_recovery_entry_lots() (партия P0-3: lots_executed
+            входной заявки и остаток позиции — разные величины;
+            остаток меняется только по достоверным снимкам брокера
+            через sync_recovery_quantity).
         Возвращает True, если количество обновлено.
         """
         if pos.state != PositionState.OPEN:
             logging.warning(
                 f"[execution] apply_late {pos.ticker}: состояние {pos.state.value} — "
                 f"автоматическое изменение количества запрещено "
-                f"(RECOVERY — sync_recovery_quantity, CLOSING/UNCERTAIN — сверка/оператор)"
+                f"(RECOVERY — record_recovery_entry_lots, "
+                f"CLOSING/UNCERTAIN — сверка/оператор)"
             )
             return False
         if pos.direction != "BUY":
@@ -756,39 +945,3 @@ class ExecutionMonitor:
                     f"{type(e).__name__}: {e}"
                 )
         self.monitoring_error = bool(data.get("monitoring_error", False))
-def record_recovery_entry_lots(
-    self, pos: TrackedPosition, executed_lots: int
-) -> bool:
-    """Обновляет накопленное исполнение BUY, не меняя текущий остаток."""
-    if pos.state != PositionState.RECOVERY:
-        return False
-
-    try:
-        lots = int(executed_lots)
-    except (TypeError, ValueError):
-        return False
-
-    if lots < 0:
-        return False
-
-    previous = int(pos.entry_applied_lots or 0)
-
-    if lots < previous:
-        logging.error(
-            f"[execution] {pos.ticker}: противоречие исполнения "
-            f"{lots} < {previous}; quantity не изменяется"
-        )
-        return False
-
-    if lots == previous:
-        return False
-
-    pos.entry_applied_lots = lots
-    pos.executed_lots = lots
-
-    logging.warning(
-        f"[execution] {pos.ticker}: накопленное исполнение BUY "
-        f"обновлено {previous} -> {lots}; "
-        f"текущий остаток quantity={pos.quantity} НЕ изменён"
-    )
-    return True

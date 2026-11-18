@@ -81,6 +81,32 @@
 #     CANCELLED/EXPIRED не теряется.
 #   - Новые события: POSITION_ENTRY_LATE_FILL, BUY_UNKNOWN_FIGI.
 #
+# ИЗМЕНЕНИЯ (партия P0-3 — разделение «остаток позиции» и «исполнение заявки»):
+#   Дефект: sync_recovery_quantity() использовалась для двух разных величин —
+#   актуальный остаток позиции по достоверному снимку брокерского портфеля и
+#   накопительное lots_executed старой BUY-заявки. Повторный ответ старой
+#   заявки восстанавливал проданные оператором лоты, устаревший меньший
+#   lots_executed ошибочно уменьшал позицию.
+#   - register_executed_buy(): повторный ответ входной BUY-заявки для
+#     RECOVERY-позиции обрабатывается методом record_recovery_entry_lots()
+#     (исполнение конкретной заявки): применяются только ДЕЙСТВИТЕЛЬНО новые
+#     лоты (сверх учтённых и сверх уже виденных у этой заявки по реестру);
+#     повторный ответ с тем же значением ничего не меняет; устаревший
+#     меньший lots_executed — противоречие: позиция не изменяется,
+#     client.uncertain_state=True + заявка переводится в UNCERTAIN (новые
+#     BUY по FIGI блокируются существующим механизмом реестра).
+#   - promote_recovery_positions(): перед промоцией финальное накопительное
+#     lots_executed больше НЕ подставляется в количество через
+#     sync_recovery_quantity (тот — только для достоверных снимков
+#     портфеля). Используется record_recovery_entry_lots: счётчики исполнения
+#     обновляются, в позицию попадают только новые лоты, устаревший ответ —
+#     противоречие (промоция отложена, UNCERTAIN). Остаток позиции остаётся
+#     равным последнему достоверно подтверждённому брокерскому остатку;
+#     синхронизация остатка — только по достоверным снимкам (reconcile).
+#   - sync_recovery_quantity() остаётся ЕДИНСТВЕННЫМ путём актуализации
+#     количества RECOVERY-позиции по ДОСТОВЕРНОМУ снимку брокерского
+#     портфеля (reconcile-сверка, адопция).
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   _load_state, resolve_closing/resolve_uncertain (execution.py — см. его
@@ -977,10 +1003,52 @@ async def register_executed_buy(
             )
         qty_before = existing.quantity
         applied = False
-        if existing.state == PositionState.RECOVERY and executed_lots != existing.quantity:
-            # Поздний рост исполнения при RECOVERY: каноническая синхронизация
-            # количества (дефект №6: знак отдельно, количество положительное).
-            applied = monitor.sync_recovery_quantity(existing, executed_lots)
+        contradiction = False
+        if existing.state == PositionState.RECOVERY:
+            # Партия P0-3: повторная обработка накопительного lots_executed
+            # BUY-заявки для RECOVERY-позиции — НЕ sync_recovery_quantity():
+            # lots_executed заявки и остаток позиции у брокера — разные
+            # величины (оператор мог продать часть позиции). Применяются
+            # только действительно новые лоты (сверх учтённых и сверх уже
+            # виденных у этой заявки); повторный ответ с тем же значением
+            # ничего не меняет. Связь заявки с позицией проверяется по
+            # entry_order_id (и FIGI — ветка найдена по FIGI позиции).
+            seen_before = None
+            if rec_pre is not None:
+                try:
+                    seen_before = int(rec_pre.get("executed_lots") or 0)
+                except (TypeError, ValueError):
+                    seen_before = None
+            baseline_before = max(
+                int(existing.entry_applied_lots or 0),
+                seen_before if seen_before is not None else 0,
+            )
+            applied = monitor.record_recovery_entry_lots(
+                existing, executed_lots, order_id=order_id,
+                already_seen_lots=seen_before,
+            )
+            if (not applied
+                    and int(executed_lots) < baseline_before):
+                # Противоречие/устаревший ответ: исполнение не убывает,
+                # позиция и счётчики не изменяются; фиксируется
+                # неопределённость и блокировка новых BUY по FIGI
+                # существующей архитектурой (uncertain_state + реестр).
+                contradiction = True
+                client.uncertain_state = True
+                if ledger is not None:
+                    ledger.record_uncertain(
+                        order_id, figi=figi, ticker=ticker,
+                        side="BUY", executed_lots=int(executed_lots),
+                        reason=(f"противоречие: lots_executed={executed_lots} меньше "
+                                f"учтённых {baseline_before} — исполнение не убывает, "
+                                f"позиция не изменена, требуется проверка оператором"),
+                        source=source or "register_executed_buy",
+                    )
+                logging.error(
+                    f"[register] {ticker}: устаревший/противоречивый ответ заявки "
+                    f"{order_id} (lots_executed={executed_lots} < учтённых "
+                    f"{baseline_before}) — UNCERTAIN, новые BUY по {figi} заблокированы"
+                )
         elif existing.state == PositionState.OPEN:
             # Партия P0-2: поздние дополнительные лоты ПОСЛЕ перехода в OPEN
             # (например, отчёт брокера обновился после терминального CANCELLED).
@@ -1013,6 +1081,10 @@ async def register_executed_buy(
                         f"Цена входа: {existing.entry_price:.4f} (не менялась)\n"
                         f"SL: {existing.sl_price:.4f}\nTP: {existing.tp_price:.4f} — сохранены"
                     )
+            elif contradiction:
+                # Реестр уже переведён в UNCERTAIN выше — перезапись запрещена:
+                # противоречие должно оставаться видимым до разрешения.
+                pass
             elif rec is not None and rec["status"] not in _TERMINAL_ORDER_STATUSES:
                 ledger.record_status(
                     order_id, ledger_status, executed_lots=executed_lots,
@@ -1426,7 +1498,9 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
                              reason="активна (сторона неизвестна)", source="poll_unknown")
 
 
-async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMonitor, rm: RiskManager):
+async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMonitor,
+                                     rm: RiskManager,
+                                     ledger: Optional[OrderLedger] = None):
     """
     Восстановление цены входа для RECOVERY-позиций (этап 5).
 
@@ -1435,8 +1509,18 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
     EXPIRED — пока заявка жива (NEW/PARTIALLYFILL), возможны дополнительные
     исполнения и промоция зафиксировала бы неполное количество) и появлении
     цены исполнения загружаются свечи, SL/TP рассчитываются штатной
-    стратегией, позиция переводится в OPEN. Перед промоцией количество
-    доуточняется по финальному lots_executed (sync_recovery_quantity).
+    стратегией, позиция переводится в OPEN.
+
+    Партия P0-3: финальное накопительное lots_executed входной заявки — это
+    НЕ остаток позиции у брокера. Оно НЕ подставляется в quantity через
+    sync_recovery_quantity (тот предназначен для достоверных снимков
+    портфеля): обрабатывается record_recovery_entry_lots — обновляются
+    счётчики исполнения, в позицию добавляются только ДЕЙСТВИТЕЛЬНО новые
+    лоты (сверх учтённых и сверх уже виденных у этой заявки по реестру).
+    Устаревший меньший lots_executed — противоречие: промоция откладывается,
+    количество не уменьшается, фиксируется неопределённость. Остаток позиции
+    остаётся равным последнему достоверно подтверждённому брокерскому
+    остатку (сверка/адопция).
 
     Позиция БЕЗ order_id (адоптированная из reconcile/старта) остаётся в
     RECOVERY под контролем оператора: цена не заменяется произвольной,
@@ -1452,6 +1536,18 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
                     f"[recovery] {pos.ticker}: RECOVERY без order_id "
                     f"(source={pos.recovery_source}) — цена входа не восстанавливается "
                     f"автоматически; закрытие только вручную оператором"
+                )
+            continue
+        if pos.direction != "BUY":
+            # Партия P0-3: накопительное исполнение входной BUY-заявки
+            # применимо только к BUY (LONG)-позициям. SHORT-RECOVERY остаётся
+            # под контролем оператора/сверки (количество — только по
+            # достоверным снимкам брокера).
+            _promote_throttle["alive"] += 1
+            if _promote_throttle["alive"] % 20 == 1:
+                logging.warning(
+                    f"[recovery] {pos.ticker}: SHORT-RECOVERY с order_id — "
+                    f"промоция по отчёту входной заявки не выполняется"
                 )
             continue
 
@@ -1475,12 +1571,48 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
             continue
 
         broker_le = int(getattr(state, "lots_executed", 0) or 0)
-        # Финальная синхронизация количества ПЕРЕД промоцией: лоты, исполненные
-        # до терминального статуса (в т.ч. поздний рост отчёта), попадают в
-        # позицию. Противоречие количества — оператор, промоция отложена.
-        if broker_le > 0 and broker_le != pos.quantity:
-            if not monitor.sync_recovery_quantity(pos, broker_le):
+        # Партия P0-3: финальное накопительное lots_executed входной заявки —
+        # НЕ готовое значение текущего остатка позиции (остаток у брокера мог
+        # измениться внешними операциями). Применяется только ДЕЙСТВИТЕЛЬНО
+        # новый рост исполнения (сверх учтённых и сверх уже виденных у этой
+        # заявки): счётчики исполнения обновляются, дельта новых лотов
+        # добавляется к остатку. Устаревший меньший lots_executed —
+        # противоречие: количество НЕ уменьшается, промоция откладывается.
+        if broker_le > 0:
+            seen = None
+            rec = ledger.latest(pos.entry_order_id) if ledger is not None else None
+            if rec is not None:
+                try:
+                    seen = int(rec.get("executed_lots") or 0)
+                except (TypeError, ValueError):
+                    seen = None
+            baseline = max(
+                int(pos.entry_applied_lots or 0),
+                seen if seen is not None else 0,
+            )
+            if broker_le < baseline:
+                logging.error(
+                    f"[recovery] {pos.ticker}: lots_executed={broker_le} заявки "
+                    f"{pos.entry_order_id} меньше учтённых/виденных {baseline} — "
+                    f"противоречие (исполнение не убывает), промоция отложена"
+                )
+                client.uncertain_state = True
+                if ledger is not None:
+                    ledger.record_uncertain(
+                        pos.entry_order_id, trade_id=pos.trade_id,
+                        figi=pos.figi, ticker=pos.ticker, side="BUY",
+                        executed_lots=broker_le,
+                        reason=(f"противоречие при промоции RECOVERY: lots_executed="
+                                f"{broker_le} меньше учтённых {baseline} — "
+                                f"исполнение не убывает"),
+                        source="promote_recovery",
+                    )
                 continue
+            if monitor.record_recovery_entry_lots(
+                    pos, broker_le, order_id=pos.entry_order_id,
+                    already_seen_lots=seen):
+                # Изменение позиции/счётчиков сохраняется немедленно (D6)
+                _save_state_checked(monitor, rm)
 
         le = broker_le or pos.executed_lots or pos.quantity
         exec_price = ExecutionMonitor._extract_price(state, le, pos.lot_size)
@@ -1734,7 +1866,7 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
 
     # 3.6 Этап 5: восстановление цены входа для RECOVERY-позиций
     if ledger is not None:
-        await promote_recovery_positions(client, monitor, rm)
+        await promote_recovery_positions(client, monitor, rm, ledger)
 
     # 4. Если uncertain — reconcile
     if client.is_uncertain():

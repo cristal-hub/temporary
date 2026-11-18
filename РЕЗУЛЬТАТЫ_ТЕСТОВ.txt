@@ -1,0 +1,288 @@
+===============================================================================
+РЕЗУЛЬТАТЫ ТЕСТОВ — партия P0-3 (разделение «остаток позиции»/«исполнение заявки»)
+Дата прогона: 2026-11-18 (UTC)
+Окружение: Python 3.12.16, pytest 9.0.2, pytest-asyncio 1.3.0,
+           t-tech-investments 0.3.3 (реальный T-Invest SDK установлен и импортируется;
+           сами тесты по архитектуре проекта используют FakeClient — без сетевых вызовов)
+===============================================================================
+
+=== 1) БАЗОВЫЙ ПРОГОН (temporary/main, ДО правок P0-3): полный набор ===
+    return datetime.utcnow().replace(tzinfo=timezone.utc)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+260 passed, 32 warnings in 11.38s
+
+=== 2) ПОЛНЫЙ НАБОР ПОСЛЕ ПРАВОК P0-3 (263 теста, поимённо) ===
+tests/test_check_sandbox.py::test_is_trade_operation_buy PASSED          [  0%]
+tests/test_check_sandbox.py::test_is_trade_operation_sell PASSED         [  0%]
+tests/test_check_sandbox.py::test_is_trade_operation_broker_fee PASSED   [  1%]
+tests/test_check_sandbox.py::test_is_trade_operation_other PASSED        [  1%]
+tests/test_check_sandbox.py::test_is_broker_fee_true PASSED              [  1%]
+tests/test_check_sandbox.py::test_is_broker_fee_false PASSED             [  2%]
+tests/test_check_sandbox.py::test_payment_float_negative PASSED          [  2%]
+tests/test_check_sandbox.py::test_payment_float_positive PASSED          [  3%]
+tests/test_check_sandbox.py::test_payment_float_none PASSED              [  3%]
+tests/test_check_sandbox.py::test_payment_float_broken PASSED            [  3%]
+tests/test_close_all_positions.py::test_lock_exclusive PASSED            [  4%]
+tests/test_close_all_positions.py::test_cancel_orders_our_figi PASSED    [  4%]
+tests/test_close_all_positions.py::test_cancel_orders_foreign_figi_stops
+tests/test_close_all_positions.py::test_cancel_orders_partial_fill_warns_but_continues
+tests/test_close_all_positions.py::test_main_short_not_sent PASSED       [  5%]
+tests/test_commission.py::test_extract_commission_positive PASSED        [  6%]
+tests/test_commission.py::test_extract_commission_zero_units_but_nano
+tests/test_commission.py::test_extract_commission_none_returns_none
+tests/test_commission.py::test_extract_commission_zero_returns_none
+tests/test_commission.py::test_extract_commission_negative_nano_abs
+tests/test_commission.py::test_extract_commission_missing_attr_returns_none
+tests/test_commission.py::test_extract_commission_broken_money_no_units
+tests/test_commission.py::test_extract_commission_and_price_independent
+tests/test_commission.py::test_extract_price_with_commission_present
+tests/test_commission.py::test_extract_commission_large_value PASSED     [  9%]
+tests/test_diag_max_lots.py::test_main_positions_none PASSED             [  9%]
+tests/test_diag_max_lots.py::test_main_empty_portfolio PASSED            [ 10%]
+tests/test_diag_max_lots.py::test_main_max_lots_none PASSED              [ 10%]
+tests/test_diagnose_sandbox.py::test_parse_tickers_ok PASSED             [ 11%]
+tests/test_diagnose_sandbox.py::test_parse_tickers_multiple PASSED       [ 11%]
+tests/test_diagnose_sandbox.py::test_parse_tickers_with_spaces PASSED    [ 11%]
+tests/test_diagnose_sandbox.py::test_parse_tickers_empty_string PASSED   [ 12%]
+tests/test_diagnose_sandbox.py::test_parse_tickers_empty_element PASSED  [ 12%]
+tests/test_diagnose_sandbox.py::test_parse_tickers_space_inside PASSED   [ 12%]
+tests/test_diagnose_sandbox.py::test_main_without_yes PASSED             [ 13%]
+tests/test_diagnose_sandbox.py::test_main_empty_tickers PASSED           [ 13%]
+tests/test_diagnose_sandbox.py::test_main_unknown_ticker_returns_2
+tests/test_diagnose_sandbox.py::test_main_found_ticker_returns_0 PASSED  [ 14%]
+tests/test_diagnose_sandbox.py::test_main_empty_stops_ok PASSED          [ 14%]
+tests/test_execution.py::test_sl_trigger_buy PASSED                      [ 15%]
+tests/test_execution.py::test_tp_trigger_buy PASSED                      [ 15%]
+tests/test_execution.py::test_no_trigger_inside_range PASSED             [ 15%]
+tests/test_execution.py::test_no_prices_sets_monitoring_error PASSED     [ 16%]
+tests/test_execution.py::test_missing_price_sets_monitoring_error
+tests/test_execution.py::test_double_trigger_only_once PASSED            [ 17%]
+tests/test_execution.py::test_register_kwargs PASSED                     [ 17%]
+tests/test_execution.py::test_register_rejects_duplicate PASSED          [ 17%]
+tests/test_execution.py::test_has_active_position_false_for_unknown
+tests/test_execution.py::test_has_active_position_true_for_uncertain
+tests/test_execution.py::test_has_active_position_false_for_closed
+tests/test_execution.py::test_resolve_closing_fill_full PASSED           [ 19%]
+tests/test_execution.py::test_resolve_closing_fill_but_partial_becomes_uncertain
+tests/test_execution.py::test_resolve_closing_partial_fill_becomes_uncertain
+tests/test_execution.py::test_resolve_closing_partial_fill_no_double_subtract
+tests/test_execution.py::test_resolve_closing_partial_fill_zero_lots_executed
+tests/test_execution.py::test_resolve_closing_decreasing_lots_executed_is_uncertain
+tests/test_execution.py::test_resolve_closing_rejected_returns_open
+tests/test_execution.py::test_resolve_closing_rejected_with_partial_becomes_uncertain
+tests/test_execution.py::test_resolve_closing_cancelled_with_partial_becomes_uncertain
+tests/test_execution.py::test_resolve_closing_state_none_is_uncertain
+tests/test_execution.py::test_resolve_closing_no_order_id_is_uncertain
+tests/test_execution.py::test_resolve_closing_idempotent PASSED          [ 23%]
+tests/test_execution.py::test_extract_price_divides_by_lots_and_lot_size
+tests/test_execution.py::test_extract_price_lot_size_gt_1 PASSED         [ 24%]
+tests/test_execution.py::test_extract_price_zero_lots_returns_none
+tests/test_execution.py::test_extract_price_zero_lot_size_returns_none
+tests/test_execution.py::test_extract_price_handles_none PASSED          [ 25%]
+tests/test_execution.py::test_resolve_uncertain_no_broker_position_closes
+tests/test_execution.py::test_resolve_uncertain_direction_mismatch_stays_uncertain
+tests/test_execution.py::test_resolve_uncertain_quantity_mismatch_stays_uncertain
+tests/test_execution.py::test_resolve_uncertain_unknown_direction_stays_uncertain
+tests/test_execution.py::test_resolve_uncertain_match_opens PASSED       [ 27%]
+tests/test_execution.py::test_export_import_roundtrip PASSED             [ 27%]
+tests/test_execution.py::test_import_state_skips_bad_records PASSED      [ 28%]
+tests/test_fail_closed.py::test_reconcile_error_does_not_clear_uncertain
+tests/test_fail_closed.py::test_reconcile_empty_ok_clears_uncertain
+tests/test_fail_closed.py::test_trading_cycle_blocks_entry_on_positions_error
+tests/test_fail_closed.py::test_trading_cycle_exits_on_no_prices PASSED  [ 29%]
+tests/test_fail_closed.py::test_log_trade_returns_true_on_success
+tests/test_fail_closed.py::test_log_trade_returns_false_on_error PASSED  [ 30%]
+tests/test_fail_closed.py::test_process_closing_does_not_mark_logged_on_write_failure
+tests/test_fail_closed.py::test_mixed_commission_source PASSED           [ 31%]
+tests/test_main.py::test_reconcile_ok PASSED                             [ 31%]
+tests/test_main.py::test_reconcile_empty_broker_local_open_mismatch
+tests/test_main.py::test_reconcile_quantity_mismatch PASSED              [ 32%]
+tests/test_main.py::test_reconcile_direction_mismatch PASSED             [ 32%]
+tests/test_main.py::test_reconcile_api_error PASSED                      [ 33%]
+tests/test_main.py::test_reconcile_currency_skipped PASSED               [ 33%]
+tests/test_main.py::test_save_load_state_roundtrip PASSED                [ 33%]
+tests/test_main.py::test_load_state_missing_returns_false PASSED         [ 34%]
+tests/test_main.py::test_load_state_corrupted_returns_false PASSED       [ 34%]
+tests/test_main.py::test_process_closing_resolves_uncertain PASSED       [ 34%]
+tests/test_main_helpers.py::test_trade_id_not_logged_empty_file PASSED   [ 35%]
+tests/test_main_helpers.py::test_trade_id_logged_present PASSED          [ 35%]
+tests/test_main_helpers.py::test_trade_id_empty_returns_false PASSED     [ 36%]
+tests/test_main_helpers.py::test_reconcile_skips_currency PASSED         [ 36%]
+tests/test_main_helpers.py::test_reconcile_empty_portfolio_clears_uncertain
+tests/test_main_helpers.py::test_reconcile_unknown_position_adopted_as_recovery
+tests/test_main_helpers.py::test_reconcile_known_position_ok PASSED      [ 37%]
+tests/test_main_helpers.py::test_reconcile_closed_but_present_adopted_as_recovery
+tests/test_main_helpers.py::test_reconcile_does_not_duplicate_local
+tests/test_main_helpers.py::test_reconcile_positions_none_keeps_uncertain
+tests/test_main_helpers.py::test_process_closing_model_commission
+tests/test_main_helpers.py::test_process_closing_actual_commission
+tests/test_main_helpers.py::test_process_closing_mixed_commission_is_mixed
+tests/test_main_helpers.py::test_process_closing_entry_and_exit_sum_to_total
+tests/test_main_helpers.py::test_process_closing_slippage_percent
+tests/test_main_helpers.py::test_process_closing_cumulative_net_pnl
+tests/test_main_helpers.py::test_process_closing_idempotent PASSED       [ 41%]
+tests/test_main_helpers.py::test_process_closing_trade_id_already_logged_marks_logged
+tests/test_p0_batch2_late_execution.py::test_ledger_open_orders_includes_pending_residual
+tests/test_p0_batch2_late_execution.py::test_n1_no_premotion_while_order_alive
+tests/test_p0_batch2_late_execution.py::test_n1_promotion_only_at_terminal_syncs_final_quantity
+tests/test_p0_batch2_late_execution.py::test_n2_open_position_late_lots_increase_no_double
+tests/test_p0_batch2_late_execution.py::test_n2_open_position_shrink_is_contradiction
+tests/test_p0_batch2_late_execution.py::test_n3_unknown_figi_execution_not_registered_global_block
+tests/test_p0_batch2_late_execution.py::test_n3_register_guard_direct_returns_none
+tests/test_p0_batch2_late_execution.py::test_n4_late_growth_after_terminal_cancelled_actually_repolled
+tests/test_p0_batch2_late_execution.py::test_n4_no_resurrection_after_position_closed
+tests/test_p0_batch2_late_execution.py::test_integration_trading_cycle_partial_cancel_recovery_open_late_lots
+tests/test_p0_batch2_late_execution.py::test_p03_1_repeated_buy_report_does_not_restore_sold_lots
+tests/test_p0_batch2_late_execution.py::test_p03_2_stale_buy_report_contradiction_blocks_buy
+tests/test_p0_batch2_late_execution.py::test_p03_3_reliable_snapshot_can_decrease_position
+tests/test_p0_defect_fixes.py::test_scenario_1_partial_buy_cancelled_portfolio_silent
+tests/test_p0_defect_fixes.py::test_defect1_unavailable_portfolio_with_confirmed_lots_registers
+tests/test_p0_defect_fixes.py::test_scenario_2_cancelled_with_executed_lots
+tests/test_p0_defect_fixes.py::test_scenario_3_expired_with_executed_lots
+tests/test_p0_defect_fixes.py::test_scenario_4_repeated_poll_no_quantity_doubling
+tests/test_p0_defect_fixes.py::test_scenario_5_late_execution_after_cancel
+tests/test_p0_defect_fixes.py::test_poll_registers_before_cancel PASSED  [ 49%]
+tests/test_p0_defect_fixes.py::test_defect3_created_at_not_reset_by_status_updates
+tests/test_p0_defect_fixes.py::test_scenario_6_new_order_regularly_polled_reaches_timeout
+tests/test_p0_defect_fixes.py::test_scenario_7_age_restored_after_restart
+tests/test_p0_defect_fixes.py::test_scenario_8_unknown_side_order_blocks_buy_by_figi
+tests/test_p0_defect_fixes.py::test_scenario_9_unknown_figi_order_blocks_buy_globally
+tests/test_p0_defect_fixes.py::test_defect4_unknown_side_resolves_only_without_execution
+tests/test_p0_defect_fixes.py::test_scenario_10_corrupted_ledger_blocks_buy
+tests/test_p0_defect_fixes.py::test_scenario_11_ledger_read_error_blocks_buy
+tests/test_p0_defect_fixes.py::test_defect5_tail_corruption_no_truncate_blocks_buy
+tests/test_p0_defect_fixes.py::test_defect5_missing_file_is_valid_empty_registry
+tests/test_p0_defect_fixes.py::test_scenario_12_short_recovery_quantity_canonical
+tests/test_p0_defect_fixes.py::test_defect6_resolve_uncertain_short_uses_abs
+tests/test_p0_defect_fixes.py::test_scenario_13_sltp_exception_still_registers_recovery
+tests/test_p0_defect_fixes.py::test_scenario_14_record_sent_fill_zero_lots_not_confirmed
+tests/test_p0_defect_fixes.py::test_scenario_14_fill_zero_lots_resolves_after_reconnect
+tests/test_p0_defect_fixes.py::test_defect8_poll_fill_zero_lots_stays_uncertain
+tests/test_p0_defect_fixes.py::test_scenario_15_repeated_recovery_same_order_id_no_duplicate
+tests/test_p0_defect_fixes.py::test_scenario_16_registered_partial_not_added_again
+tests/test_p0_defect_fixes.py::test_defect2_only_executed_quantity_registered
+tests/test_p0_defect_fixes.py::test_uncertain_buy_order_does_not_block_position_management
+tests/test_persistence.py::test_save_state_creates_file PASSED           [ 57%]
+tests/test_persistence.py::test_load_state_restores_positions_and_counts
+tests/test_persistence.py::test_subprocess_saves_state_then_killed
+tests/test_persistence.py::test_second_process_restores_state PASSED     [ 58%]
+tests/test_persistence.py::test_load_state_corrupted_json PASSED         [ 58%]
+tests/test_persistence.py::test_load_state_missing_file PASSED           [ 59%]
+tests/test_persistence.py::test_load_state_false_blocks_entries PASSED   [ 59%]
+tests/test_persistence.py::test_no_auto_restore_from_portfolio PASSED    [ 60%]
+tests/test_persistence.py::test_save_state_write_error_returns_false
+tests/test_risk_manager.py::test_position_size_positive PASSED           [ 60%]
+tests/test_risk_manager.py::test_zero_balance_returns_zero PASSED        [ 61%]
+tests/test_risk_manager.py::test_balance_none_returns_zero PASSED        [ 61%]
+tests/test_risk_manager.py::test_daily_limit PASSED                      [ 61%]
+tests/test_risk_manager.py::test_sl_tp_buy PASSED                        [ 62%]
+tests/test_risk_manager.py::test_sl_tp_sell PASSED                       [ 62%]
+tests/test_risk_manager.py::test_sl_tp_invalid_direction PASSED          [ 63%]
+tests/test_risk_manager.py::test_friction_includes_commission PASSED     [ 63%]
+tests/test_risk_manager.py::test_exposure_units_lots_lot_size_price
+tests/test_risk_manager.py::test_exposure_blocks_on_high_exposure
+tests/test_risk_manager.py::test_unknown_price_blocks PASSED             [ 64%]
+tests/test_risk_manager.py::test_unknown_instrument_blocks PASSED        [ 65%]
+tests/test_risk_manager.py::test_positions_none_blocks PASSED            [ 65%]
+tests/test_risk_manager.py::test_prices_none_blocks PASSED               [ 65%]
+tests/test_risk_manager.py::test_empty_portfolio_is_ok PASSED            [ 66%]
+tests/test_risk_manager.py::test_currency_positions_skipped PASSED       [ 66%]
+tests/test_risk_manager.py::test_export_import_roundtrip PASSED          [ 66%]
+tests/test_risk_manager.py::test_import_state_bad_date_falls_back_to_today
+tests/test_risk_manager.py::test_import_state_non_dict_ignored PASSED    [ 67%]
+tests/test_safety.py::test_sandbox_required PASSED                       [ 68%]
+tests/test_safety.py::test_sandbox_default_ok PASSED                     [ 68%]
+tests/test_safety.py::test_sandbox_default_is_true PASSED                [ 68%]
+tests/test_safety.py::test_telegram_auth_rejects_unknown PASSED          [ 69%]
+tests/test_safety.py::test_telegram_auth_rejects_when_not_set PASSED     [ 69%]
+tests/test_safety.py::test_telegram_auth_rejects_no_user PASSED          [ 69%]
+tests/test_safety.py::test_uncertain_blocks_entries PASSED               [ 70%]
+tests/test_screener.py::test_screener_returns_top_n PASSED               [ 70%]
+tests/test_screener.py::test_screener_valid_result_less_than_10 PASSED   [ 71%]
+tests/test_screener.py::test_screener_filters_low_turnover PASSED        [ 71%]
+tests/test_screener.py::test_screener_returns_none_on_empty PASSED       [ 71%]
+tests/test_screener.py::test_screener_cache PASSED                       [ 72%]
+tests/test_screener.py::test_screener_partial_scan_returns_none PASSED   [ 72%]
+tests/test_screener.py::test_screener_full_error_returns_none PASSED     [ 73%]
+tests/test_screener.py::test_screener_error_does_not_return_stale_cache
+tests/test_screener.py::test_screener_partial_scan_does_not_return_partial_result
+tests/test_slippage.py::test_entry_slippage_unfavorable_positive PASSED  [ 74%]
+tests/test_slippage.py::test_entry_slippage_favorable_negative PASSED    [ 74%]
+tests/test_slippage.py::test_entry_slippage_zero PASSED                  [ 74%]
+tests/test_slippage.py::test_exit_slippage_unfavorable_positive PASSED   [ 75%]
+tests/test_slippage.py::test_exit_slippage_favorable_negative PASSED     [ 75%]
+tests/test_slippage.py::test_exit_slippage_zero PASSED                   [ 76%]
+tests/test_slippage.py::test_total_slippage_with_shares PASSED           [ 76%]
+tests/test_slippage.py::test_total_slippage_mixed_sign PASSED            [ 76%]
+tests/test_slippage.py::test_entry_slippage_formula_matches_main_py
+tests/test_slippage.py::test_exit_slippage_formula_matches_main_py
+tests/test_slippage.py::test_exit_slippage_old_formula_would_be_negative
+tests/test_strategy.py::test_insufficient_data_returns_hold PASSED       [ 78%]
+tests/test_strategy.py::test_ma100_missing_blocks_signal PASSED          [ 78%]
+tests/test_strategy.py::test_volume_confirmation_rejects_low_volume
+tests/test_strategy.py::test_volume_confirmation_accepts_spike PASSED    [ 79%]
+tests/test_strategy.py::test_adx_hysteresis_does_not_flip_immediately
+tests/test_strategy.py::test_prepare_dataframe_drops_incomplete_when_asked
+tests/test_strategy.py::test_prepare_dataframe_keeps_incomplete_by_default
+tests/test_strategy.py::test_adx_same_candle_does_not_increase_streak
+tests/test_strategy.py::test_adx_flips_after_two_new_candles PASSED      [ 81%]
+tests/test_strategy.py::test_adx_candidate_reversal_resets_streak
+tests/test_strategy.py::test_prepare_dataframe_keeps_unknown_completion_status[None]
+tests/test_strategy.py::test_prepare_dataframe_keeps_unknown_completion_status[nan]
+tests/test_strategy.py::test_prepare_dataframe_drops_explicit_false
+tests/test_telegram_handlers.py::test_authorized_allowed_user PASSED     [ 83%]
+tests/test_telegram_handlers.py::test_authorized_unknown_user PASSED     [ 83%]
+tests/test_telegram_handlers.py::test_authorized_allowed_none PASSED     [ 84%]
+tests/test_telegram_handlers.py::test_authorized_no_user PASSED          [ 84%]
+tests/test_telegram_handlers.py::test_start_command_authorized PASSED    [ 84%]
+tests/test_telegram_handlers.py::test_stop_command_authorized PASSED     [ 85%]
+tests/test_telegram_handlers.py::test_status_command_authorized PASSED   [ 85%]
+tests/test_telegram_handlers.py::test_start_command_unauthorized PASSED  [ 85%]
+tests/test_telegram_handlers.py::test_stop_command_unauthorized PASSED   [ 86%]
+tests/test_telegram_handlers.py::test_status_command_unauthorized
+tests/test_tinkoff_client.py::test_get_positions_long PASSED             [ 87%]
+tests/test_tinkoff_client.py::test_get_positions_short PASSED            [ 87%]
+tests/test_tinkoff_client.py::test_get_positions_zero_excluded PASSED    [ 87%]
+tests/test_tinkoff_client.py::test_get_positions_lot_size_gt_1 PASSED    [ 88%]
+tests/test_tinkoff_client.py::test_get_positions_unresolved_remainder
+tests/test_tinkoff_client.py::test_get_positions_api_error_returns_none
+tests/test_tinkoff_client.py::test_get_positions_empty_portfolio PASSED  [ 89%]
+tests/test_tinkoff_client.py::test_get_last_prices_ok PASSED             [ 89%]
+tests/test_tinkoff_client.py::test_get_last_prices_error_returns_none
+tests/test_tinkoff_client.py::test_get_last_prices_empty_returns_empty_dict
+tests/test_tinkoff_client.py::test_get_account_balance_ok PASSED         [ 90%]
+tests/test_tinkoff_client.py::test_get_account_balance_error_returns_none
+tests/test_tinkoff_client.py::test_post_market_order_success PASSED      [ 91%]
+tests/test_tinkoff_client.py::test_post_market_order_error_preserves_order_id
+tests/test_tinkoff_client.py::test_cancel_order_success PASSED           [ 92%]
+tests/test_tinkoff_client.py::test_cancel_order_error_returns_none
+tests/test_tinkoff_client.py::test_cancel_then_check_status PASSED       [ 93%]
+tests/test_tinkoff_client.py::test_get_sandbox_max_lots_ok PASSED        [ 93%]
+tests/test_tinkoff_client.py::test_get_sandbox_max_lots_sell_none
+tests/test_tinkoff_client.py::test_get_sandbox_max_lots_both_none_returns_none
+tests/test_tinkoff_client.py::test_get_sandbox_max_lots_error_returns_none
+tests/test_tinkoff_client.py::test_get_sandbox_max_lots_with_price
+tests/test_tinkoff_client_currency.py::test_currency_rub_no_uncertain
+tests/test_tinkoff_client_currency.py::test_currency_fractional_no_uncertain
+tests/test_tinkoff_client_currency.py::test_share_remainder_uncertain
+tests/test_tinkoff_client_currency.py::test_share_correct_quantity
+tests/test_tinkoff_client_currency.py::test_api_error_fail_closed
+tests/test_tinkoff_client_currency.py::test_currency_ok_share_error_preserved
+tests/test_trading_flag.py::test_start_trading_creates_flag PASSED       [ 97%]
+tests/test_trading_flag.py::test_stop_trading_removes_flag PASSED        [ 98%]
+tests/test_trading_flag.py::test_is_trading_enabled_true PASSED          [ 98%]
+tests/test_trading_flag.py::test_is_trading_enabled_false PASSED         [ 98%]
+tests/test_trading_flag.py::test_start_trading_error_does_not_raise
+tests/test_trading_flag.py::test_stop_trading_does_not_touch_positions
+tests/test_trading_flag.py::test_no_flag_blocks_new_entries PASSED       [100%]
+
+====================== 263 passed, 32 warnings in 11.69s =======================
+
+=== 3) ТРИ НОВЫХ ТЕСТА P0-3 ПОИМЁННО ===
+tests/test_p0_batch2_late_execution.py::test_p03_1_repeated_buy_report_does_not_restore_sold_lots PASSED [ 84%]
+tests/test_p0_batch2_late_execution.py::test_p03_2_stale_buy_report_contradiction_blocks_buy PASSED [ 92%]
+tests/test_p0_batch2_late_execution.py::test_p03_3_reliable_snapshot_can_decrease_position PASSED [100%]
+
+=== 4) ФАЙЛ tests/test_p0_batch2_late_execution.py ЦЕЛИКОМ (13 тестов) ===
+======================== 13 passed, 2 warnings in 2.53s ========================
