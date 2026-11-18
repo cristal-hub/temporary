@@ -56,6 +56,17 @@
 #     в вечном UNCERTAIN из-за знака.
 #
 # НЕ ИЗМЕНЕНО: PositionState (кроме добавления RECOVERY), get_position,
+#
+# ИЗМЕНЕНИЯ (партия P0-2 — поздние исполнения после перехода в OPEN):
+#   apply_late_entry_lots() — применяет поздние дополнительные лоты входной
+#   заявки к УЖЕ ОТКРЫТОЙ (OPEN) позиции: отчёт брокера может обновиться
+#   после терминального статуса (CANCELLED/EXPIRED с поздним ростом
+#   lots_executed). Правила: только для OPEN/LONG с совпадающей
+#   entry-заявкой; рост — quantity += дельта, SL/TP НЕ пересчитываются
+#   (абсолютные уровни стратегии не меняются); уменьшение/нечисловое
+#   значение — противоречие, без изменений; CLOSING/UNCERTAIN — без
+#   автоматических изменений (сверка/оператор); RECOVERY — через
+#   sync_recovery_quantity().
 #   has_active_position, active_count, имена остальных полей TrackedPosition.
 
 import logging
@@ -354,6 +365,73 @@ class ExecutionMonitor:
         pos.quantity = abs_lots
         pos.executed_lots = abs_lots
         pos.entry_applied_lots = abs_lots
+        return True
+
+    def apply_late_entry_lots(self, pos: TrackedPosition, executed_lots: int,
+                              order_id: Optional[str] = None) -> bool:
+        """
+        Партия P0-2: поздние дополнительные лоты входной заявки ПОСЛЕ перехода
+        позиции в OPEN (отчёт брокера обновился после терминального статуса,
+        например CANCELLED с поздним ростом lots_executed).
+
+        Правила:
+          - применяется ТОЛЬКО к OPEN-позиции LONG (direction="BUY") с
+            совпадающей entry-заявкой (order_id == entry_order_id, если
+            оба известны);
+          - рост (executed_lots > entry_applied_lots): quantity += дельта,
+            entry_applied_lots/executed_lots = executed_lots. SL/TP НЕ
+            пересчитываются — это абсолютные уровни стратегии (параметры
+            стратегии не меняются);
+          - уменьшение противоречит неизменности исполнения — БЕЗ изменений,
+            False (исполнение не убывает);
+          - CLOSING/UNCERTAIN — БЕЗ автоматических изменений (решение —
+            сверка/оператор); RECOVERY синхронизируется sync_recovery_quantity().
+        Возвращает True, если количество обновлено.
+        """
+        if pos.state != PositionState.OPEN:
+            logging.warning(
+                f"[execution] apply_late {pos.ticker}: состояние {pos.state.value} — "
+                f"автоматическое изменение количества запрещено "
+                f"(RECOVERY — sync_recovery_quantity, CLOSING/UNCERTAIN — сверка/оператор)"
+            )
+            return False
+        if pos.direction != "BUY":
+            logging.error(
+                f"[execution] apply_late {pos.ticker}: направление {pos.direction} — "
+                f"поздние лоты входной BUY-заявки неприменимы"
+            )
+            return False
+        if order_id and pos.entry_order_id and order_id != pos.entry_order_id:
+            logging.error(
+                f"[execution] apply_late {pos.ticker}: заявка {order_id} не совпадает "
+                f"с entry_order_id={pos.entry_order_id} — без изменений"
+            )
+            return False
+        try:
+            le = int(executed_lots)
+        except (TypeError, ValueError):
+            logging.error(
+                f"[execution] apply_late {pos.ticker}: некорректное executed_lots={executed_lots!r}"
+            )
+            return False
+        applied = int(pos.entry_applied_lots or 0)
+        if le <= applied:
+            if le < applied:
+                logging.error(
+                    f"[execution] apply_late {pos.ticker}: lots_executed={le} < уже "
+                    f"применённых {applied} — противоречие (исполнение не убывает), "
+                    f"без изменений"
+                )
+            return False
+        delta = le - applied
+        pos.quantity = pos.quantity + delta
+        pos.entry_applied_lots = le
+        pos.executed_lots = le
+        logging.warning(
+            f"[execution] {pos.ticker}: ПОЗДНЕЕ исполнение входной заявки "
+            f"+{delta} лот. (итого исполнено {le}) — quantity={pos.quantity}, "
+            f"SL/TP сохранены ({pos.sl_price:.4f}/{pos.tp_price:.4f})"
+        )
         return True
 
     def get_position(self, figi: str) -> Optional[TrackedPosition]:

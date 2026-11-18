@@ -55,6 +55,17 @@
 #     незавершённой/неопределённой заявкой (BUY, side=None, UNCERTAIN);
 #     has_unknown_figi_open_orders() — глобальная блокировка BUY при заявке
 #     без FIGI.
+#
+# ИЗМЕНЕНИЯ (партия P0-2 — поздние исполнения после терминального статуса):
+#   open_orders() дополнительно возвращает заявки в терминальном статусе С
+#   ИСПОЛНЕНИЕМ (CANCELLED/REJECTED/EXPIRED с executed_lots>0; FILL при
+#   исполнении меньше запрошенного) — «residual-сверка»: отчёт брокера может
+#   обновиться ПОСЛЕ терминального статуса (поздние лоты), и повторный опрос
+#   обязан продолжаться, пока рост исполнения возможен. Заявка перестаёт
+#   возвращаться, когда исполнение применено к учёту и роста нет (защита от
+#   «воскрешения» закрытой позиции — в main.register_executed_buy/poll).
+#   Терминальные заявки без исполнения по-прежнему закрываются в реестре
+#   сразу и блокировку BUY снимают.
 
 import json
 import logging
@@ -345,12 +356,15 @@ class OrderLedger:
 
     def record_uncertain(self, order_id: str, *, trade_id: str = None, figi: str = None,
                          ticker: str = None, side: str = None, requested_lots: int = None,
-                         executed_lots: int = None, reason: str = "", source: str = "",
+                         executed_lots: int = None, avg_exec_price: float = None,
+                         reason: str = "", source: str = "",
                          error: str = None) -> bool:
-        """Неопределённое состояние (НЕ отказ). Блокирует BUY по FIGI до разрешения."""
+        """Неопределённое состояние (НЕ отказ). Блокирует BUY по FIGI до разрешения.
+        Партия P0-2: avg_exec_price сохраняется, если известна (для оператора)."""
         return self.append(STATUS_UNCERTAIN, order_id, trade_id=trade_id, figi=figi,
                            ticker=ticker, side=side, requested_lots=requested_lots,
-                           executed_lots=executed_lots, reason=reason, source=source,
+                           executed_lots=executed_lots, avg_exec_price=avg_exec_price,
+                           reason=reason, source=source,
                            error=error)
 
     # ------------------------------------------------------------------
@@ -366,11 +380,48 @@ class OrderLedger:
     def latest_all(self) -> Dict[str, dict]:
         return dict(self._latest)
 
+    def _pending_residual_execution(self, rec: dict) -> bool:
+        """
+        Партия P0-2: терминальная заявка с неисполненным residual-исполнением,
+        требующая повторной сверки (отчёт брокера может обновиться после
+        терминального статуса — поздние лоты).
+
+        Возвращается в open_orders():
+          - CANCELLED/REJECTED/EXPIRED с executed_lots > 0;
+          - FILL при 0 < executed_lots < requested_lots (исполнение меньше
+            запрошенного — рост ещё возможен).
+        Терминальные заявки с executed_lots == 0 и полным FILL — False
+        (достоверно разрешены, повторная сверка не требуется).
+        """
+        status = rec.get("status")
+        if status not in TERMINAL_STATUSES:
+            return False
+        try:
+            le = int(rec.get("executed_lots") or 0)
+        except (TypeError, ValueError):
+            le = 0
+        if le <= 0:
+            return False
+        if status in DEAD_WITHOUT_EXECUTION:
+            return True
+        try:
+            requested = int(rec.get("requested_lots") or 0)
+        except (TypeError, ValueError):
+            requested = 0
+        return requested > 0 and le < requested
+
     def open_orders(self, side: Optional[str] = None) -> List[dict]:
-        """Заявки в нетерминальном состоянии (INTENT/SENT/NEW/PARTIALLYFILL/UNCERTAIN)."""
+        """
+        Заявки, доступные для опроса/сверки:
+          - нетерминальные (INTENT/SENT/NEW/PARTIALLYFILL/UNCERTAIN);
+          - партия P0-2: терминальные с residual-исполнением
+            (_pending_residual_execution) — поздний рост lots_executed после
+            терминального CANCELLED/EXPIRED должен быть замечен повторным
+            опросом (сверка реально выполняется, а не только описана).
+        """
         result = []
         for rec in self._latest.values():
-            if rec["status"] in NON_TERMINAL_STATUSES:
+            if rec["status"] in NON_TERMINAL_STATUSES or self._pending_residual_execution(rec):
                 if side is None or rec.get("side") == side:
                     result.append(rec)
         return result

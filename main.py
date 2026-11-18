@@ -58,6 +58,29 @@
 #     PARTIAL_FILL, ORDER_NOT_FILLED, RECONCILE_*, CLOSE_*) сохранены.
 #     SIGNAL дополнен полем order_id (создаётся до записи события).
 #
+# ИЗМЕНЕНИЯ (партия P0-2 — поздние исполнения и промоция RECOVERY):
+#   - promote_recovery_positions(): RECOVERY -> Open ТОЛЬКО при ТЕРМИНАЛЬНОМ
+#     статусе входной заявки (FILL/CANCELLED/REJECTED/EXPIRED). Пока заявка
+#     жива (NEW/PARTIALLYFILL), возможны дополнительные исполнения — позиция
+#     остаётся в RECOVERY, количество синхронизируется опросом/reconcile.
+#     Перед промоцией количество доуточняется по финальному lots_executed.
+#   - register_executed_buy(): поздние дополнительные лоты ПОСЛЕ перехода
+#     позиции в OPEN применяются к количеству (apply_late_entry_lots),
+#     SL/TP не пересчитываются; синхронизация RECOVERY и запись в реестр
+#     сохраняются немедленно.
+#   - register_executed_buy(): исполнение с ПУСТЫМ (неопределённым) FIGI НЕ
+#     регистрируется как обычная BUY-позиция — заявка остаётся UNCERTAIN,
+#     новые BUY запрещены ГЛОБАЛЬНО до разрешения (has_unknown_figi_open_orders).
+#   - register_executed_buy(): защита от «воскрешения» закрытой позиции —
+#     терминальная заявка, чьё исполнение уже применено к учёту (executed_lots
+#     в реестре), без активной позиции не регистрируется повторно; рост
+#     lots_executed сверх учтённого обрабатывается как позднее исполнение.
+#   - poll_open_orders(): повторная сверка терминальных заявок с исполнением
+#     РЕАЛЬНО выполняется (order_ledger.open_orders() возвращает заявки с
+#     residual-исполнением) — поздний рост lots_executed после терминального
+#     CANCELLED/EXPIRED не теряется.
+#   - Новые события: POSITION_ENTRY_LATE_FILL, BUY_UNKNOWN_FIGI.
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   _load_state, resolve_closing/resolve_uncertain (execution.py — см. его
@@ -161,7 +184,7 @@ ledger_ref = None
 state_save_failed = False
 
 _strategy_event_keys = set()
-_promote_throttle = {"n": 0}
+_promote_throttle = {"n": 0, "alive": 0}
 
 
 def is_trading_enabled() -> bool:
@@ -884,6 +907,58 @@ async def register_executed_buy(
         )
         return None
 
+    if not figi:
+        # Партия P0-2: исполнение с ПУСТЫМ (неопределённым) FIGI не может быть
+        # зарегистрировано как обычная BUY-позиция — неизвестно, какой инструмент
+        # затронут. Заявка остаётся UNCERTAIN (НЕ отказ), новые BUY запрещены
+        # ГЛОБАЛЬНО до разрешения (has_unknown_figi_open_orders в trading_cycle);
+        # существующие позиции продолжают мониториться.
+        logging.error(
+            f"[register] {ticker}: figi отсутствует при подтверждённом исполнении "
+            f"{executed_lots} лот. (order_id={order_id}) — авторегистрация позиции "
+            f"ЗАПРЕЩЕНА: UNCERTAIN + глобальная блокировка новых BUY"
+        )
+        client.uncertain_state = True
+        if ledger is not None and order_id:
+            ledger.record_uncertain(
+                order_id, trade_id=trade_id, figi=None, ticker=ticker,
+                side="BUY", requested_lots=requested_lots,
+                executed_lots=executed_lots, avg_exec_price=exec_price,
+                reason="исполнение без FIGI — авторегистрация позиции запрещена, "
+                       "требуется разрешение оператором",
+                source=source or "register_executed_buy",
+            )
+        research_logger.log_event("BUY_UNKNOWN_FIGI", {
+            "order_id": order_id, "ticker": ticker,
+            "executed_lots": executed_lots, "source": source,
+        })
+        await notify(
+            "⛔ Исполнение с НЕИЗВЕСТНЫМ FIGI\n"
+            f"Исполнено лотов: {executed_lots} (order_id={order_id or '—'})\n"
+            "Позиция НЕ зарегистрирована автоматически (инструмент неизвестен).\n"
+            "Новые BUY запрещены ГЛОБАЛЬНО до разрешения. Требуется оператор."
+        )
+        return None
+
+    # Партия P0-2: защита от «воскрешения» закрытой позиции. Терминальная
+    # заявка, чьё исполнение УЖЕ применено к учёту (executed_lots в записи
+    # реестра совпадает с сообщённым брокером), без активной позиции не
+    # регистрируется повторно. Рост lots_executed сверх учтённого — это
+    # ПОЗДНЕЕ исполнение: обрабатывается штатно ниже. Страховка при
+    # расхождении — reconcile-адопция по достоверному снимку брокера.
+    rec_pre = ledger.latest(order_id) if (ledger is not None and order_id) else None
+    if (rec_pre is not None
+            and rec_pre.get("status") in _TERMINAL_ORDER_STATUSES
+            and not monitor.has_active_position(figi)):
+        recorded_le = int(rec_pre.get("executed_lots") or 0)
+        if executed_lots <= recorded_le:
+            logging.warning(
+                f"[register] {ticker}: исполнение заявки {order_id} ({executed_lots} лот.) "
+                f"уже применено к учёту (в реестре {recorded_le}), активной позиции нет — "
+                f"повторная регистрация не выполняется (защита от «воскрешения»)"
+            )
+            return None
+
     if monitor.has_active_position(figi):
         existing = monitor.get_position(figi)
         logging.warning(
@@ -900,11 +975,45 @@ async def register_executed_buy(
                 f"[register] {ticker}: RECOVERY-позиция связана с заявкой "
                 f"{order_id} — восстановление цены входа возможно"
             )
+        qty_before = existing.quantity
+        applied = False
         if existing.state == PositionState.RECOVERY and executed_lots != existing.quantity:
-            monitor.sync_recovery_quantity(existing, executed_lots)
+            # Поздний рост исполнения при RECOVERY: каноническая синхронизация
+            # количества (дефект №6: знак отдельно, количество положительное).
+            applied = monitor.sync_recovery_quantity(existing, executed_lots)
+        elif existing.state == PositionState.OPEN:
+            # Партия P0-2: поздние дополнительные лоты ПОСЛЕ перехода в OPEN
+            # (например, отчёт брокера обновился после терминального CANCELLED).
+            applied = monitor.apply_late_entry_lots(existing, executed_lots, order_id)
         if ledger is not None and order_id:
             rec = ledger.latest(order_id)
-            if rec is not None and rec["status"] not in _TERMINAL_ORDER_STATUSES:
+            if applied:
+                ledger.record_status(
+                    order_id, ledger_status, executed_lots=executed_lots,
+                    avg_exec_price=exec_price,
+                    reason=f"позднее исполнение применено к позиции "
+                           f"(+{existing.quantity - qty_before} лот., итого {existing.quantity})",
+                    source=source or "register_executed_buy",
+                )
+                _save_state_checked(monitor, rm)
+                research_logger.log_event("POSITION_ENTRY_LATE_FILL", {
+                    "figi": figi, "ticker": ticker, "order_id": order_id,
+                    "added_lots": existing.quantity - qty_before,
+                    "quantity": existing.quantity,
+                    "state": existing.state.value,
+                    "entry_price": existing.entry_price,
+                    "sl": existing.sl_price, "tp": existing.tp_price,
+                    "source": source,
+                })
+                if existing.state == PositionState.OPEN:
+                    await notify(
+                        f"⚠️ <b>{ticker}</b>: позднее исполнение входной заявки\n"
+                        f"Добавлено лотов: +{existing.quantity - qty_before} "
+                        f"(итого {existing.quantity})\n"
+                        f"Цена входа: {existing.entry_price:.4f} (не менялась)\n"
+                        f"SL: {existing.sl_price:.4f}\nTP: {existing.tp_price:.4f} — сохранены"
+                    )
+            elif rec is not None and rec["status"] not in _TERMINAL_ORDER_STATUSES:
                 ledger.record_status(
                     order_id, ledger_status, executed_lots=executed_lots,
                     avg_exec_price=exec_price,
@@ -1067,7 +1176,13 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
         регистрация подтверждённых лотов, затем отмена остатка (дефект №1);
       - заявки с неизвестной стороной (side=None) опрашиваются: завершение
         без исполнения разрешает блокировку; признаки исполнения при
-        неизвестной стороне остаются UNCERTAIN для оператора (дефект №4).
+        неизвестной стороне остаются UNCERTAIN для оператора (дефект №4);
+      - партия P0-2: терминальные заявки С ИСПОЛНЕНИЕМ (CANCELLED/EXPIRED с
+        executed_lots>0, FILL при исполнении меньше запрошенного) остаются
+        доступны для повторной сверки (order_ledger.open_orders) — поздний
+        рост lots_executed после терминального статуса не теряется;
+        повторная регистрация уже применённого исполнения без активной
+        позиции запрещена («воскрешение» закрытой позиции).
     """
     for rec in list(ledger.open_orders(side="BUY")):
         order_id = rec["order_id"]
@@ -1105,6 +1220,28 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
                                     side="BUY", executed_lots=le,
                                     reason="FILL противоречие: lots_executed=0 при опросе",
                                     source="poll")
+            continue
+
+        # Партия P0-2: терминальная запись реестра при терминальном статусе
+        # брокера и БЕЗ активной позиции. Исполнение, уже применённое к учёту
+        # (executed_lots записи), повторно не регистрируется («воскрешение»
+        # закрытой позиции запрещено). Поздний рост lots_executed сверх
+        # учтённого — расхождение учёта с брокером: разрешается СВЕРКОЙ
+        # (адопция по ДОСТОВЕРНОМУ снимку брокера показывает фактический
+        # остаток), а не автоматической регистрацией по отчёту заявки.
+        if (rec.get("status") in _TERMINAL_ORDER_STATUSES
+                and status in _TERMINAL_ORDER_STATUSES
+                and not monitor.has_active_position(figi)):
+            recorded_le = int(rec.get("executed_lots") or 0)
+            if le <= recorded_le:
+                continue
+            logging.error(
+                f"[poll] {ticker}: поздний рост исполнения заявки {order_id} "
+                f"({recorded_le} -> {le} лот.) при закрытой/отсутствующей позиции — "
+                f"требуется сверка с брокером (адопция по снимку), "
+                f"авторегистрация по отчёту заявки не выполняется"
+            )
+            client.uncertain_state = True
             continue
 
         if status == "FILL" or le > 0 or status == "PARTIALLYFILL":
@@ -1294,8 +1431,12 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
     Восстановление цены входа для RECOVERY-позиций (этап 5).
 
     Если у позиции есть entry_order_id — запрашивается статус заявки; при
-    появлении цены исполнения загружаются свечи, SL/TP рассчитываются штатной
-    стратегией (rm.calculate_sl_tp), позиция переводится в OPEN.
+    ТЕРМИНАЛЬНОМ статусе заявки (партия P0-2: только FILL/CANCELLED/REJECTED/
+    EXPIRED — пока заявка жива (NEW/PARTIALLYFILL), возможны дополнительные
+    исполнения и промоция зафиксировала бы неполное количество) и появлении
+    цены исполнения загружаются свечи, SL/TP рассчитываются штатной
+    стратегией, позиция переводится в OPEN. Перед промоцией количество
+    доуточняется по финальному lots_executed (sync_recovery_quantity).
 
     Позиция БЕЗ order_id (адоптированная из reconcile/старта) остаётся в
     RECOVERY под контролем оператора: цена не заменяется произвольной,
@@ -1318,7 +1459,30 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
         if state is None:
             continue
 
-        le = int(getattr(state, "lots_executed", 0) or 0) or pos.executed_lots or pos.quantity
+        # Партия P0-2: промоция ТОЛЬКО при терминальном статусе заявки.
+        # Пока заявка жива (NEW/PARTIALLYFILL), возможны дополнительные
+        # исполнения: количество продолжает синхронизироваться опросом/
+        # reconcile, позиция остаётся в RECOVERY.
+        status = _status_name(getattr(state, "execution_report_status", None))
+        if status not in _TERMINAL_ORDER_STATUSES:
+            _promote_throttle["alive"] += 1
+            if _promote_throttle["alive"] % 20 == 1:
+                logging.info(
+                    f"[recovery] {pos.ticker}: заявка {pos.entry_order_id} ещё активна "
+                    f"(status={status}) — возможны дополнительные исполнения, "
+                    f"промоция отложена до терминального статуса"
+                )
+            continue
+
+        broker_le = int(getattr(state, "lots_executed", 0) or 0)
+        # Финальная синхронизация количества ПЕРЕД промоцией: лоты, исполненные
+        # до терминального статуса (в т.ч. поздний рост отчёта), попадают в
+        # позицию. Противоречие количества — оператор, промоция отложена.
+        if broker_le > 0 and broker_le != pos.quantity:
+            if not monitor.sync_recovery_quantity(pos, broker_le):
+                continue
+
+        le = broker_le or pos.executed_lots or pos.quantity
         exec_price = ExecutionMonitor._extract_price(state, le, pos.lot_size)
         if not exec_price or exec_price <= 0:
             continue
