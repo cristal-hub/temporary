@@ -25,6 +25,30 @@
 #       закрытой позиции). Каждая запись — только короткий order_id,
 #       размер архива пренебрежим: безопасность важнее экономии байт.
 #   Торговая логика (SL/TP, закрытия, промоция) не менялась.
+#
+# ИЗМЕНЕНИЯ (этап BUY REGISTRATION FIX 3 — защита на уровне execution.py):
+#   apply_late_entry_lots() и record_recovery_entry_lots() отклоняют
+#   исполнение с ПУСТЫМ/ОТСУТСТВУЮЩИМ order_id (None, "", только пробелы):
+#   немедленный return False БЕЗ каких-либо изменений позиции (quantity,
+#   entry_price, entry_applied_lots, entry_order_id не трогаются).
+#   Обоснование: отсутствие достоверного идентификатора — НЕОПРЕДЕЛЁННОСТЬ,
+#   а не разрешение применить исполнение. Раньше проверка принадлежности
+#   (`if order_id and pos.entry_order_id and order_id != pos.entry_order_id`)
+#   при пустом order_id пропускалась, и дельта применялась к существующей
+#   позиции без какого-либо подтверждения, что исполнение относится именно
+#   к этой позиции. Теперь:
+#   - пустой/missing order_id — отклонение (лог + return False);
+#   - чужой (несовпадающий с entry_order_id) order_id — отклонение
+#     (как и прежде);
+#   - собственный корректный order_id — штатное применение дельты
+#     (как и прежде).
+#   Основная защита — в вызывающем коде main.py (register_executed_buy:
+#   guard BUY_EXEC_NO_ORDER_ID, uncertain_state, диагностика); эти проверки
+#   — защита в глубину на уровне самого модуля: даже при обходе вызывающего
+#   кода метод не применит лоты без идентификатора. Совместимость: все
+#   текущие вызовы (main.py: register_executed_buy OPEN/RECOVERY-ветки,
+#   promote_recovery_positions) передают непустой order_id, проверенный
+#   вызывающим кодом; поведение остальных методов не менялось.
 import logging
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -221,6 +245,21 @@ class ExecutionMonitor:
     def record_recovery_entry_lots(self, pos, executed_lots, order_id=None, already_seen_lots=None):
         if pos.state != PositionState.RECOVERY or pos.direction != "BUY":
             return False
+        # Этап BUY REGISTRATION FIX 3 (защита в глубину): исполнение БЕЗ
+        # достоверного order_id отклоняется целиком — отсутствие
+        # идентификатора это НЕОПРЕДЕЛЁННОСТЬ, а НЕ разрешение применить
+        # лоты. Позиция не изменяется (quantity/entry_price/
+        # entry_applied_lots не трогаются); разрешение неопределённости —
+        # вызывающим кодом (uncertain_state + диагностика) и сверкой.
+        if not str(order_id or "").strip():
+            logging.error(
+                f"[execution] record_recovery_entry_lots: отклонено — "
+                f"исполнение без достоверного order_id "
+                f"(figi={pos.figi}, ticker={pos.ticker}, "
+                f"entry_order_id={pos.entry_order_id or '—'}, "
+                f"executed_lots={executed_lots}) — лоты НЕ применены"
+            )
+            return False
         if order_id and pos.entry_order_id and order_id != pos.entry_order_id:
             return False
         try:
@@ -249,6 +288,22 @@ class ExecutionMonitor:
 
     def apply_late_entry_lots(self, pos, executed_lots, order_id=None):
         if pos.state != PositionState.OPEN or pos.direction != "BUY":
+            return False
+        # Этап BUY REGISTRATION FIX 3 (защита в глубину): исполнение БЕЗ
+        # достоверного order_id отклоняется целиком — отсутствие
+        # идентификатора это НЕОПРЕДЕЛЁННОСТЬ, а НЕ разрешение применить
+        # лоты к уже открытой позиции. Позиция не изменяется (quantity/
+        # entry_price/entry_applied_lots не трогаются); разрешение
+        # неопределённости — вызывающим кодом (uncertain_state +
+        # диагностика) и сверкой.
+        if not str(order_id or "").strip():
+            logging.error(
+                f"[execution] apply_late_entry_lots: отклонено — "
+                f"исполнение без достоверного order_id "
+                f"(figi={pos.figi}, ticker={pos.ticker}, "
+                f"entry_order_id={pos.entry_order_id or '—'}, "
+                f"executed_lots={executed_lots}) — лоты НЕ применены"
+            )
             return False
         if order_id and pos.entry_order_id and order_id != pos.entry_order_id:
             return False

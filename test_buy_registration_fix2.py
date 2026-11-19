@@ -28,13 +28,29 @@
 #                                  test_f_recovery_notifies_unsaved_state
 #   Тест G — обычная регистрация BUY и неудачное сохранение:
 #                                  test_g_primary_buy_unsaved_state
+#
+# Этап BUY REGISTRATION FIX 3 (исполнение BUY без order_id) — тесты H1-H6
+# добавлены в ЭТОТ ЖЕ файл (по ТЗ FIX 3 файл не перемещается, не
+# переименовывается и не дублируется):
+#   Тест H1 — order_id=None:       test_h1_order_id_none_not_applied
+#   Тест H2 — order_id="":         test_h2_order_id_empty_not_applied
+#   Тест H3 — order_id="   ":      test_h3_order_id_blank_not_applied
+#   Тест H4 — повтор события:      test_h4_repeat_no_order_id_idempotent
+#   Тест H5 — контроль своей заявки:
+#                              test_h5_matching_order_id_still_applies
+#   Тест H6 — контроль чужой заявки (совпадение trade_id):
+#                              test_h6_foreign_order_still_blocked
 
 import json
+import os
+from decimal import Decimal
 
 import pytest
 
+import logger
 import main
 from execution import ExecutionMonitor, PositionState
+from tinkoff_client import PositionData
 
 from tests.test_p0_defect_fixes import (
     FakeClient, FakeRM,
@@ -467,3 +483,555 @@ async def test_g_primary_buy_unsaved_state(env, monkeypatch):
     assert len([p for p in m2.positions.values()
                 if p.state in (PositionState.OPEN, PositionState.RECOVERY)]) == 1, \
         "повторный разбор события создал дубликат позиции"
+
+
+# ============================================================
+# Этап BUY REGISTRATION FIX 3 — исполнение BUY без order_id
+# ============================================================
+
+def journal_all(ledger):
+    """Все записи журнала реестра (журнал append-only)."""
+    with open(ledger.path, "r", encoding="utf-8") as f:
+        return [json.loads(x) for x in f if x.strip()]
+
+
+def diagnostic_events(env):
+    """События диагностики (research_events.jsonl, файл перенаправлен env)."""
+    path = logger.EVENTS_FILE
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(x) for x in f if x.strip()]
+
+
+def no_order_id_kwargs(order_id_value, trade_id, executed=5, requested=5):
+    kw = open_kwargs(order_id_value, trade_id=trade_id, executed=executed,
+                     requested=requested)
+    kw["df"] = None
+    return kw
+
+
+async def run_no_order_id_event(client, monitor, rm, ledger, order_id_value,
+                                trade_id):
+    return await main.register_executed_buy(
+        client, monitor, rm, ledger,
+        **no_order_id_kwargs(order_id_value, trade_id))
+
+
+def assert_no_order_id_rejected(env, ledger, client, monitor, pos_b,
+                                journal_before, oid_b, order_id_raw, trade_id_in):
+    """Общие проверки H1-H3: позиция не изменена, неопределённость
+    зафиксирована, успешного маркера нет, диагностика записана."""
+    # 1-4: лоты не применены — quantity/entry_price/entry_applied_lots
+    # не изменены, привязка позиции не изменена, вторая позиция не создана
+    assert pos_b.quantity == 3, "quantity изменён исполнением без order_id"
+    assert pos_b.entry_applied_lots == 3, "entry_applied_lots изменён"
+    assert pos_b.entry_price == 100.0, "entry_price изменён"
+    assert pos_b.entry_order_id == oid_b, "привязка позиции изменена"
+    assert pos_b.state == PositionState.OPEN
+    assert len(monitor.positions) == 1, "создана вторая позиция по тому же FIGI"
+
+    # 6-7: неопределённость зафиксирована — глобальный флаг, которым
+    # trading_cycle запрещает новые входы до устранения
+    assert client.uncertain_state is True, "uncertain_state не установлен"
+    assert client.is_uncertain(), "новые BUY не заблокированы (is_uncertain)"
+
+    # 5: успешной отметки регистрации исполнения нет: журнал реестра не
+    # получил НИ ОДНОЙ новой записи (событие не адресуемо order_id),
+    # фиктивные идентификаторы не придуманы
+    journal_after = journal_all(ledger)
+    assert journal_after == journal_before, \
+        "исполнение без order_id изменило реестр (возможен ложный маркер регистрации)"
+    assert not any(str(r.get("order_id")) in ("None", "") for r in journal_after), \
+        "для события без order_id придумана фиктивная запись/ID в реестре"
+
+    # 8: диагностическое событие с причиной отсутствия order_id
+    evs = [e for e in diagnostic_events(env)
+           if e.get("event") == "BUY_EXEC_NO_ORDER_ID"]
+    assert len(evs) == 1, \
+        f"ожидалось 1 диагностическое событие, записано {len(evs)}"
+    ev = evs[0]
+    assert ev["figi"] == FIGI and ev["ticker"] == TICKER
+    assert ev["executed_lots"] == 5
+    assert ev["requested_lots"] == 5
+    assert ev["trade_id"] == trade_id_in
+    assert ev["order_id_raw"] == order_id_raw, \
+        "причина отсутствия order_id не отражена в диагностике"
+    assert ev["position_state"] == "OPEN"
+    assert ev["entry_order_id"] == oid_b
+    assert ev["entry_applied_lots"] == 3 and ev["position_quantity"] == 3
+    assert "order_id" in str(ev.get("note") or ""), \
+        "в диагностике нет причины (отсутствие order_id)"
+
+
+@pytest.mark.asyncio
+async def test_h1_order_id_none_not_applied(env):
+    """H1 (FIX 3): OPEN-позиция B существует; приходит исполнение с
+    order_id=None. Лоты НЕ применяются: quantity/entry_price/
+    entry_applied_lots не изменены; successful-маркера нет;
+    uncertain_state=True (новые BUY запрещены); диагностическое событие с
+    причиной отсутствия order_id записано; фиктивные ID не придумываются."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos_b = await make_open_b(client, monitor, rm, ledger,
+                              order_id="oid-H1-B", trade_id="t-H1B")
+    assert pos_b.state == PositionState.OPEN
+    assert pos_b.quantity == 3 and pos_b.entry_applied_lots == 3
+    assert pos_b.entry_price == 100.0
+
+    journal_before = _journal_all_safe(ledger)
+    client.uncertain_state = False
+    res = await run_no_order_id_event(client, monitor, rm, ledger, None,
+                                      trade_id="t-H1X")
+    assert res is pos_b, "создана вторая позиция по тому же FIGI"
+    assert_no_order_id_rejected(env, ledger, client, monitor, pos_b,
+                                journal_before, "oid-H1-B", None, "t-H1X")
+
+
+@pytest.mark.asyncio
+async def test_h2_order_id_empty_not_applied(env):
+    """H2 (FIX 3): тот же сценарий с order_id="" — те же проверки."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos_b = await make_open_b(client, monitor, rm, ledger,
+                              order_id="oid-H2-B", trade_id="t-H2B")
+    assert pos_b.state == PositionState.OPEN
+    assert pos_b.quantity == 3 and pos_b.entry_applied_lots == 3
+
+    journal_before = _journal_all_safe(ledger)
+    client.uncertain_state = False
+    res = await run_no_order_id_event(client, monitor, rm, ledger, "",
+                                      trade_id="t-H2X")
+    assert res is pos_b
+    assert_no_order_id_rejected(env, ledger, client, monitor, pos_b,
+                                journal_before, "oid-H2-B", "", "t-H2X")
+
+
+@pytest.mark.asyncio
+async def test_h3_order_id_blank_not_applied(env):
+    """H3 (FIX 3): тот же сценарий с order_id="   " (только пробелы) —
+    те же проверки."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos_b = await make_open_b(client, monitor, rm, ledger,
+                              order_id="oid-H3-B", trade_id="t-H3B")
+    assert pos_b.state == PositionState.OPEN
+    assert pos_b.quantity == 3 and pos_b.entry_applied_lots == 3
+
+    journal_before = _journal_all_safe(ledger)
+    client.uncertain_state = False
+    res = await run_no_order_id_event(client, monitor, rm, ledger, "   ",
+                                      trade_id="t-H3X")
+    assert res is pos_b
+    assert_no_order_id_rejected(env, ledger, client, monitor, pos_b,
+                                journal_before, "oid-H3-B", "   ", "t-H3X")
+
+
+@pytest.mark.asyncio
+async def test_h4_repeat_no_order_id_idempotent(env):
+    """H4 (FIX 3): повторное получение того же события без order_id
+    идемпотентно: позиция не меняется повторно, неопределённость
+    сохраняется, реестр не изменяется."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos_b = await make_open_b(client, monitor, rm, ledger,
+                              order_id="oid-H4-B", trade_id="t-H4B")
+    assert pos_b.quantity == 3 and pos_b.entry_applied_lots == 3
+
+    journal_before = _journal_all_safe(ledger)
+    client.uncertain_state = False
+    res1 = await run_no_order_id_event(client, monitor, rm, ledger, None,
+                                       trade_id="t-H4X")
+    assert res1 is pos_b
+    assert pos_b.quantity == 3 and pos_b.entry_applied_lots == 3
+    assert client.uncertain_state is True
+    journal_mid = _journal_all_safe(ledger)
+    assert journal_mid == journal_before, "первая обработка изменила реестр"
+
+    # повторная обработка ТОГО ЖЕ события
+    res2 = await run_no_order_id_event(client, monitor, rm, ledger, None,
+                                       trade_id="t-H4X")
+    assert res2 is pos_b
+    assert pos_b.quantity == 3, "повторная обработка изменила количество"
+    assert pos_b.entry_applied_lots == 3, \
+        "повторная обработка изменила entry_applied_lots"
+    assert pos_b.entry_price == 100.0, "повторная обработка изменила цену"
+    assert pos_b.entry_order_id == "oid-H4-B"
+    assert pos_b.state == PositionState.OPEN
+    assert client.uncertain_state is True, \
+        "неопределённость исчезла после повторной обработки"
+    assert journal_all(ledger) == journal_mid, \
+        "повторная обработка изменила реестр (повторные записи состояния)"
+
+
+@pytest.mark.asyncio
+async def test_h5_matching_order_id_still_applies(env, monkeypatch):
+    """H5 (FIX 3): контроль положительного сценария — при достоверном
+    совпадении order_id прежняя логика применения исполнения работает:
+    дельта применяется, цена входа не меняется, повтор идемпотентен,
+    ложной неопределённости нет, штатное уведомление отправляется."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    oid = "oid-H5-B"
+    pos = await make_open_b(client, monitor, rm, ledger, order_id=oid,
+                            trade_id="t-H5B")
+    assert pos.state == PositionState.OPEN
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+    client.uncertain_state = False
+
+    sent = []
+
+    async def spy_notify(text):
+        sent.append(text)
+
+    monkeypatch.setattr(main, "notify", spy_notify)
+
+    # рост cumulative своей заявки 3 -> 5: применяется дельта +2
+    res = await main.register_executed_buy(
+        client, monitor, rm, ledger,
+        **open_kwargs(oid, trade_id="t-H5B", executed=5, requested=10))
+    assert res is pos
+    assert pos.quantity == 5 and pos.entry_applied_lots == 5, \
+        "исправление FIX 3 заблокировало штатное применение своей заявки"
+    assert pos.entry_price == 100.0, "цена входа изменена ростом своей заявки"
+    assert client.uncertain_state is False, "ложная неопределённость"
+    assert ledger.latest(oid)["status"] == "FILL"
+    assert "позднее исполнение применено" in str(
+        ledger.latest(oid).get("reason") or "")
+    assert any("позднее исполнение входной заявки" in t for t in sent), \
+        "штатное уведомление о позднем исполнении не отправлено"
+
+    # повторная обработка того же отчёта — идемпотентность
+    res2 = await main.register_executed_buy(
+        client, monitor, rm, ledger,
+        **open_kwargs(oid, trade_id="t-H5B", executed=5, requested=10))
+    assert res2 is pos
+    assert pos.quantity == 5 and pos.entry_applied_lots == 5, \
+        "повторная обработка удвоила количество"
+    assert client.uncertain_state is False
+
+
+@pytest.mark.asyncio
+async def test_h6_foreign_order_still_blocked(env):
+    """H6 (FIX 3): контроль чужой заявки — защита FIX 2 сохранена:
+    исполнение старой заявки A (тот же FIGI, другой order_id, тот же
+    trade_id) не применяется к OPEN-позиции B; совпадение trade_id
+    применением не разрешает; UNCERTAIN с order_id mismatch."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos_b = await make_open_b(client, monitor, rm, ledger,
+                              order_id="oid-H6-B", trade_id="t-H6-same")
+    assert pos_b.state == PositionState.OPEN
+    assert pos_b.quantity == 3 and pos_b.entry_applied_lots == 3
+    assert pos_b.trade_id == "t-H6-same"
+
+    oid_a = "oid-H6-A"
+    ledger.record_intent(oid_a, trade_id="t-H6-same", figi=FIGI,
+                         ticker=TICKER, side="BUY", requested_lots=5)
+    client.uncertain_state = False
+    kw_a = open_kwargs(oid_a, trade_id="t-H6-same", executed=5, requested=5)
+    kw_a["df"] = None
+    res = await main.register_executed_buy(client, monitor, rm, ledger, **kw_a)
+
+    assert res is pos_b
+    assert pos_b.quantity == 3, \
+        "лоты заявки A применены к позиции B при другом order_id"
+    assert pos_b.entry_applied_lots == 3
+    assert pos_b.entry_price == 100.0
+    assert pos_b.entry_order_id == "oid-H6-B", "позиция перепривязана к A"
+    assert client.uncertain_state is True
+    rec_a = ledger.latest(oid_a)
+    assert rec_a["status"] == "UNCERTAIN", \
+        "совпадение trade_id закрыло чужую заявку как обработанную"
+    assert "order_id mismatch" in str(rec_a.get("reason") or "")
+    recs_a = journal_records_for(ledger, oid_a)
+    assert not any(r.get("status") in TERMINAL for r in recs_a)
+    assert not any("позиция уже зарегистрирована" in str(r.get("reason") or "")
+                   for r in recs_a)
+
+
+# ============================================================
+# Серия I (этап «финальный согласованный комплект FIX 3»):
+#   I1 — прямые вызовы apply_late_entry_lots (execution.py) с
+#        отсутствующим/пустым/пробельным order_id + свой/чужой ID;
+#   I2 — прямые вызовы record_recovery_entry_lots (execution.py);
+#   I3 — RECOVERY-ветка main-пути: исполнение без order_id
+#        (аналог H1–H3 для RECOVERY) + идемпотентность повтора;
+#   I4 — перезапуск: позиция восстановлена без неприменённых лотов,
+#        неопределённость не теряется молча (повтор события или
+#        расхождение снимка брокера при сверке её восстанавливают);
+#   I5 — ошибка _save_state_checked(): нет ложного подтверждения
+#        сохранения/регистрации, state_save_failed, STATE_SAVE_FAILED.
+# ============================================================
+
+
+def _make_recovery_b(monitor, order_id="oid-REC-B", executed=3):
+    """RECOVERY-позиция B по FIGI (штатный источник: отчёт без свечей —
+    регистрация через register_recovery, entry_order_id известен)."""
+    return monitor.register_recovery(
+        figi=FIGI, ticker=TICKER, direction="BUY",
+        quantity=executed, lot_size=1, order_id=order_id,
+        recovery_source="no_price")
+
+
+def _journal_all_safe(ledger):
+    """journal_all, устойчивый к отсутствию файла реестра (если в реестр
+    ещё не было ни одной записи, файла нет — реестр пуст)."""
+    if not os.path.isfile(ledger.path):
+        return []
+    return journal_all(ledger)
+
+
+@pytest.mark.asyncio
+async def test_i1_execution_apply_late_rejects_missing_order_id(env):
+    """I1 (защита в глубину execution.py): apply_late_entry_lots() при
+    order_id=None/""/пробелах возвращает False и НЕ изменяет OPEN-позицию
+    (quantity/entry_price/entry_applied_lots/entry_order_id); чужой
+    order_id отклоняется; собственный корректный order_id применяется
+    штатно (совместимость сохранена)."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    oid = "oid-I1-B"
+    pos = await make_open_b(client, monitor, rm, ledger, order_id=oid,
+                            trade_id="t-I1B")
+    assert pos.state == PositionState.OPEN
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+    assert pos.entry_price == 100.0
+
+    for bad in (None, "", "   "):
+        assert monitor.apply_late_entry_lots(pos, 5, bad) is False, \
+            f"исполнение с order_id={bad!r} применено к OPEN-позиции"
+        assert pos.quantity == 3, "quantity изменён исполнением без order_id"
+        assert pos.entry_applied_lots == 3, "entry_applied_lots изменён"
+        assert pos.entry_price == 100.0, "entry_price изменён"
+        assert pos.entry_order_id == oid, "привязка позиции изменена"
+        assert pos.state == PositionState.OPEN
+
+    # чужой (несовпадающий) order_id — отклонение на уровне метода
+    assert monitor.apply_late_entry_lots(pos, 7, "oid-foreign") is False
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+
+    # контроль совместимости: собственный корректный order_id работает
+    assert monitor.apply_late_entry_lots(pos, 5, oid) is True
+    assert pos.quantity == 5 and pos.entry_applied_lots == 5
+    assert pos.entry_price == 100.0, "цена входа изменена применением дельты"
+
+
+def test_i2_execution_record_recovery_rejects_missing_order_id(env):
+    """I2 (защита в глубину execution.py): record_recovery_entry_lots()
+    при order_id=None/""/пробелах возвращает False и НЕ изменяет
+    RECOVERY-позицию; чужой order_id отклоняется; собственный корректный
+    order_id применяется штатно (совместимость сохранена)."""
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    oid = "oid-I2-B"
+    pos = _make_recovery_b(monitor, order_id=oid)
+    assert pos.state == PositionState.RECOVERY
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+    assert pos.entry_snapshot_synced is False
+
+    for bad in (None, "", "   "):
+        assert monitor.record_recovery_entry_lots(pos, 5, order_id=bad) is False, \
+            f"исполнение с order_id={bad!r} применено к RECOVERY-позиции"
+        assert pos.quantity == 3, "quantity изменён исполнением без order_id"
+        assert pos.entry_applied_lots == 3, "entry_applied_lots изменён"
+        assert pos.entry_order_id == oid, "привязка позиции изменена"
+        assert pos.state == PositionState.RECOVERY
+
+    # чужой (несовпадающий) order_id — отклонение на уровне метода
+    assert monitor.record_recovery_entry_lots(pos, 7, order_id="oid-foreign") is False
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+
+    # контроль совместимости: собственный корректный order_id работает
+    assert monitor.record_recovery_entry_lots(pos, 5, order_id=oid) is True
+    assert pos.quantity == 5 and pos.entry_applied_lots == 5
+
+
+@pytest.mark.asyncio
+async def test_i3_recovery_branch_no_order_id_not_applied(env):
+    """I3 (RECOVERY-ветка main-пути, аналог H1–H3): активная
+    RECOVERY-позиция + исполнение без order_id (None/""/пробелы):
+    лоты НЕ применены, uncertain_state=True, диагностическое событие
+    BUY_EXEC_NO_ORDER_ID с position_state=RECOVERY, реестр не изменён;
+    повтор того же события идемпотентен."""
+    for idx, bad in enumerate((None, "", "   ")):
+        subdir = env.tmp_path / f"i3-it{idx}"
+        subdir.mkdir(exist_ok=True)
+        ledger = make_ledger(subdir)
+        client = FakeClient(positions={})
+        monitor = ExecutionMonitor(client)
+        rm = FakeRM()
+        oid = "oid-I3-B"
+        pos = _make_recovery_b(monitor, order_id=oid)
+        assert pos.state == PositionState.RECOVERY
+        assert pos.quantity == 3 and pos.entry_applied_lots == 3
+
+        journal_before = _journal_all_safe(ledger)
+        client.uncertain_state = False
+        evs_before = len([e for e in diagnostic_events(env)
+                          if e.get("event") == "BUY_EXEC_NO_ORDER_ID"])
+
+        res = await run_no_order_id_event(client, monitor, rm, ledger, bad,
+                                          trade_id="t-I3X")
+        assert res is pos, "создана вторая позиция по тому же FIGI"
+        assert pos.quantity == 3, "quantity изменён (RECOVERY-ветка)"
+        assert pos.entry_applied_lots == 3, "entry_applied_lots изменён"
+        assert pos.entry_order_id == oid, "привязка позиции изменена"
+        assert pos.state == PositionState.RECOVERY
+        assert client.uncertain_state is True, "uncertain_state не установлен"
+        assert client.is_uncertain(), "новые BUY не заблокированы"
+        assert _journal_all_safe(ledger) == journal_before, \
+            "исполнение без order_id изменило реестр (RECOVERY-ветка)"
+
+        evs = [e for e in diagnostic_events(env)
+               if e.get("event") == "BUY_EXEC_NO_ORDER_ID"]
+        assert len(evs) == evs_before + 1, \
+            "диагностическое событие не записано (RECOVERY-ветка)"
+        ev = evs[-1]
+        assert ev["position_state"] == "RECOVERY"
+        assert ev["order_id_raw"] == bad
+        assert ev["entry_order_id"] == oid
+        assert ev["entry_applied_lots"] == 3 and ev["position_quantity"] == 3
+
+        # повтор того же события — идемпотентность
+        journal_mid = _journal_all_safe(ledger)
+        price_before_repeat = pos.entry_price
+        res2 = await run_no_order_id_event(client, monitor, rm, ledger, bad,
+                                           trade_id="t-I3X")
+        assert res2 is pos
+        assert pos.quantity == 3 and pos.entry_applied_lots == 3
+        assert pos.entry_price == price_before_repeat, \
+            "повторная обработка изменила цену входа"
+        assert client.uncertain_state is True, \
+            "неопределённость исчезла после повтора"
+        assert _journal_all_safe(ledger) == journal_mid, \
+            "повтор изменил реестр (RECOVERY-ветка)"
+
+
+@pytest.mark.asyncio
+async def test_i4_uncertain_state_survives_restart(env):
+    """I4 (перезапуск): после события без order_id состояние сохранено
+    (guard вызывает _save_state_checked); после перезапуска позиция
+    восстановлена БЕЗ неприменённых лотов (quantity/entry_applied_lots
+    как до события); неопределённость не теряется молча — при повторе
+    события uncertain_state снова True; при расхождении снимка брокера
+    (лишние лоты у брокера) сверка снова фиксирует неопределённость,
+    учёт не раздувается."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRMState()
+    oid = "oid-I4-B"
+    pos = await make_open_b(client, monitor, rm, ledger, order_id=oid,
+                            trade_id="t-I4B")
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+
+    client.uncertain_state = False
+    res = await run_no_order_id_event(client, monitor, rm, ledger, None,
+                                      trade_id="t-I4X")
+    assert res is pos and client.uncertain_state is True
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+
+    # --- перезапуск: новый клиент/монитор/риск, state.json на диске ---
+    client2 = FakeClient(positions={})
+    monitor2 = ExecutionMonitor(client2)
+    rm2 = FakeRMState()
+    assert main._load_state(monitor2, rm2) is True, \
+        "guard не сохранил состояние (state.json отсутствует)"
+    pos2 = monitor2.get_position(FIGI)
+    assert pos2 is not None
+    assert pos2.quantity == 3, \
+        "неприменённые лоты попали в сохранённое состояние"
+    assert pos2.entry_applied_lots == 3
+    assert pos2.entry_order_id == oid
+    assert pos2.state == PositionState.OPEN
+    assert client2.uncertain_state is False  # новый процесс: флаг сброшен
+
+    # путь (а): то же событие приходит снова — неопределённость включается
+    client2.uncertain_state = False
+    res2 = await run_no_order_id_event(client2, monitor2, rm2, ledger, None,
+                                       trade_id="t-I4X")
+    assert res2 is pos2
+    assert client2.uncertain_state is True, \
+        "после перезапуска повтор события без order_id не заблокировал новые BUY"
+    assert pos2.quantity == 3 and pos2.entry_applied_lots == 3
+
+    # путь (б): исполнение дошло до брокера — снимок показывает 5 лот.
+    # Сверка фиксирует расхождение: uncertain_state=True, учёт не раздувается.
+    client2.uncertain_state = False
+    client2.positions_value = {FIGI: PositionData(lots=5, direction="LONG",
+                                                  raw_shares=Decimal(5))}
+    await main.reconcile(client2, monitor2, ledger, rm2)
+    assert client2.uncertain_state is True, \
+        "расхождение снимка брокера не зафиксировано как неопределённость"
+    assert main.reconcile_done is False, \
+        "сверка с расхождением помечена завершённой"
+    assert monitor2.get_position(FIGI).quantity == 3, \
+        "сверка раздула учёт без разбора расхождения"
+
+
+@pytest.mark.asyncio
+async def test_i5_save_failure_no_false_confirmation(env, monkeypatch):
+    """I5 (ошибка _save_state_checked при событии без order_id): нет
+    ложного подтверждения сохранения/регистрации — state_save_failed=True,
+    STATE_SAVE_FAILED в диагностике, реестр без новых записей
+    (успешного маркера нет), Telegram-уведомлений об успехе НЕТ."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    oid = "oid-I5-B"
+    pos = await make_open_b(client, monitor, rm, ledger, order_id=oid,
+                            trade_id="t-I5B")
+    assert pos.quantity == 3
+
+    journal_before = _journal_all_safe(ledger)
+    client.uncertain_state = False
+    main.state_save_failed = False
+
+    sent = []
+
+    async def spy_notify(text):
+        sent.append(text)
+
+    monkeypatch.setattr(main, "notify", spy_notify)
+
+    def broken_save_state(m, r):
+        return False
+
+    monkeypatch.setattr(main, "_save_state", broken_save_state)
+
+    res = await run_no_order_id_event(client, monitor, rm, ledger, None,
+                                      trade_id="t-I5X")
+    assert res is pos
+    assert pos.quantity == 3 and pos.entry_applied_lots == 3
+    assert pos.entry_price == 100.0 and pos.entry_order_id == oid
+    assert client.uncertain_state is True
+
+    # сохранение НЕ удалось — флаг установлен, событие диагностики записано
+    assert main.state_save_failed is True, \
+        "ошибка сохранения не зафиксирована (state_save_failed)"
+    evs_save = [e for e in diagnostic_events(env)
+                if e.get("event") == "STATE_SAVE_FAILED"]
+    assert len(evs_save) == 1, "STATE_SAVE_FAILED не записан в диагностику"
+
+    # ни одного Telegram-уведомления об успешной регистрации/сохранении
+    assert sent == [], \
+        f"при ошибке сохранения отправлены уведомления: {sent}"
+
+    # реестр не получил ни одной записи (успешного маркера регистрации нет)
+    assert journal_all(ledger) == journal_before
