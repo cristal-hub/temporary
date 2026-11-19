@@ -218,6 +218,35 @@
 #      («позиция уже зарегистрирована — идемпотентность» не пишется).
 #      Совпадение trade_id само по себе перепривязку не выполняет.
 #
+# ИЗМЕНЕНИЯ (этап BUY REGISTRATION FIX 2 — OPEN order_id mismatch +
+#            корректный Telegram при ошибке сохранения state.json):
+#   1. register_executed_buy(), ветка активной OPEN-позиции: проверка
+#      принадлежности исполнения СВОЕЙ заявке. Раньше отчёт старой/чужой
+#      заявки A (тот же FIGI, другой order_id) проваливался в общий блок
+#      идемпотентности: apply_late_entry_lots() отказывал (order_id не
+#      совпадает), но заявка A помечалась обработанной — писалcя
+#      терминальный статус с маркером «позиция уже зарегистрирована —
+#      идемпотентность» (или молча пропускался уже терминальный отчёт),
+#      хотя исполнение A к позиции НЕ применялось. Теперь несовпадение
+#      order_id (и неизвестный entry_order_id позиции) — явная
+#      неопределённость: client.uncertain_state + UNCERTAIN-запись реестра
+#      с причиной "order_id mismatch" и диагностикой (FIGI, order_id
+#      отчёта, entry_order_id позиции, trade_id, количество исполнения);
+#      лоты НЕ применяются, цена входа НЕ изменяется, успешный маркер НЕ
+#      пишется; совпадение trade_id применением не разрешается; новые BUY
+#      по FIGI блокированы существующей архитектурой до устранения;
+#      повторная обработка идемпотентна (неопределённость самопроизвольно
+#      не снимается).
+#   2. register_executed_buy(), уведомления после регистрации: сообщение
+#      «Позиция зарегистрирована как RECOVERY — контроль сохранён...»
+#      отправлялось безусловно, даже если _save_state_checked() вернул
+#      False. Теперь при state_saved=False отправляется отдельное
+#      критическое предупреждение (позиция только в оперативной памяти,
+#      сохранение state.json НЕ подтверждено, новые BUY заблокированы);
+#      обычное уведомление RECOVERY и уведомление первичной регистрации
+#      BUY дополняются предупреждением о несохранённом состоянии.
+#      Механизм _save_state_checked() не менялся.
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   resolve_closing/resolve_uncertain (execution.py — см. его шапку),
@@ -1399,8 +1428,61 @@ async def register_executed_buy(
                 )
                 _save_state_checked(monitor, rm)
         elif existing.state == PositionState.OPEN:
+            # Дефект P1 (этап BUY REGISTRATION FIX 2): проверка принадлежности
+            # исполнения заявке, которой соответствует OPEN-позиция. Совпадение
+            # FIGI само по себе НЕ доказывает принадлежность: отчёт старой/
+            # чужой заявки A (тот же FIGI, другой order_id) НЕ применяется к
+            # позиции B — лоты НЕ добавляются, цена входа НЕ изменяется,
+            # успешный маркер («позиция уже зарегистрирована —
+            # идемпотентность» и любой терминальный статус) НЕ пишется, даже
+            # если trade_id совпадает: принадлежность заявки и сделки
+            # проверяется согласованно, совпадение trade_id при несовпадении
+            # order_id применением не разрешается. Вместо этого — явная
+            # неопределённость (зеркало RECOVERY-ветки выше):
+            # client.uncertain_state + UNCERTAIN-запись реестра с причиной
+            # "order_id mismatch" и диагностикой (FIGI, старый order_id,
+            # текущий entry_order_id, trade_id, количество исполнения);
+            # новые BUY по FIGI блокированы существующей архитектурой
+            # (figi_blocks_buy) до устранения расхождения. Если
+            # entry_order_id позиции неизвестен — безопасное сопоставление
+            # невозможно: UNCERTAIN, а не угадывание. Повторная обработка
+            # того же события идемпотентна: лоты не удваиваются, повторные
+            # записи успешного применения не создаются, неопределённость
+            # самопроизвольно не снимается.
+            if (order_id and (not existing.entry_order_id
+                              or str(order_id) != str(existing.entry_order_id))):
+                client.uncertain_state = True
+                if ledger is not None:
+                    ledger.record_uncertain(
+                        order_id, trade_id=trade_id, figi=figi, ticker=ticker,
+                        side="BUY", requested_lots=requested_lots,
+                        executed_lots=int(executed_lots),
+                        reason=(
+                            f"order_id mismatch: отчёт заявки {order_id} "
+                            f"(trade_id={trade_id or '—'}, {executed_lots} лот.) "
+                            f"не совпадает с входной заявкой "
+                            f"{existing.entry_order_id or '—'} (trade_id="
+                            f"{existing.trade_id or '—'}) активной OPEN-позиции "
+                            f"{ticker} — исполнение к позиции НЕ применено "
+                            f"(лоты/цена входа не изменены), успешный маркер "
+                            f"не пишется; требуется сверка/решение оператора"
+                        ),
+                        source=source or "register_executed_buy",
+                    )
+                logging.error(
+                    f"[register] {ticker}: исполнение заявки {order_id} "
+                    f"(trade_id={trade_id or '—'}, {executed_lots} лот.) НЕ "
+                    f"совпадает с entry_order_id={existing.entry_order_id or '—'} "
+                    f"активной OPEN-позиции (trade_id={existing.trade_id or '—'}, "
+                    f"figi={figi}) — лоты НЕ применены, заявка НЕ отмечена "
+                    f"обработанной, UNCERTAIN (order_id mismatch)"
+                )
+                _save_state_checked(monitor, rm)
+                return existing
             # Партия P0-2: поздние дополнительные лоты ПОСЛЕ перехода в OPEN
             # (например, отчёт брокера обновился после терминального CANCELLED).
+            # Сюда попадают только исполнения СВОЕЙ заявки (order_id совпадает
+            # с entry_order_id) — идемпотентность по entry_applied_lots.
             applied = monitor.apply_late_entry_lots(existing, executed_lots, order_id)
         if ledger is not None and order_id:
             rec = ledger.latest(order_id)
@@ -1622,19 +1704,38 @@ async def register_executed_buy(
             "exec_lots": executed_lots, "sl": pos.sl_price, "tp": pos.tp_price,
             "entry_commission": entry_commission,
         })
+        # Дефект P2 (этап BUY REGISTRATION FIX 2): уведомление должно
+        # соответствовать результату сохранения state.json. При
+        # state_saved=False нельзя создавать у пользователя впечатление
+        # надёжно сохранённой позиции — к сообщению добавляется явное
+        # критическое предупреждение (позиция только в оперативной памяти,
+        # сохранение не подтверждено, новые BUY заблокированы). Ошибка
+        # сохранения не скрывается: STATE_SAVE_FAILED + лог уже записаны
+        # _save_state_checked, новые входы блокированы state_save_failed.
         if partial:
-            await notify(
+            open_msg = (
                 f"⚠️ <b>{ticker}</b> частичное исполнение BUY\n"
                 f"Исполнено: {executed_lots} лот. @ {exec_price:.4f}\n"
                 f"SL: {pos.sl_price:.4f}\nTP: {pos.tp_price:.4f}\n"
                 f"<i>{reason}</i>"
             )
         else:
-            await notify(
+            open_msg = (
                 f"🚀 <b>{ticker}</b> BUY\n"
                 f"Исполнено: {executed_lots} лот. @ {exec_price:.4f}\n"
                 f"SL: {pos.sl_price:.4f}\nTP: {pos.tp_price:.4f}\n"
                 f"<i>{reason}</i>"
+            )
+        if state_saved:
+            await notify(open_msg)
+        else:
+            await notify(
+                open_msg + "\n\n"
+                "⚠️ КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ: позиция зарегистрирована "
+                "только в оперативной памяти. Сохранение state.json НЕ "
+                "подтверждено. После перезапуска состояние может быть "
+                "потеряно. Новые BUY заблокированы. Требуется проверить "
+                "сохранение state.json и сверить позицию с брокером."
             )
     else:
         research_logger.log_event("POSITION_RECOVERED", {
@@ -1643,12 +1744,32 @@ async def register_executed_buy(
             "recovery_source": pos.recovery_source, "partial": partial,
             "source": source, "state_saved": state_saved,
         })
-        await notify(
-            f"⚠️ <b>{ticker}</b> BUY исполнен ({executed_lots} лот.), "
-            f"цена входа/SL/TP уточняются\n"
-            f"Позиция зарегистрирована как RECOVERY — контроль сохранён, "
-            f"автозакрытие отключено."
-        )
+        # Дефект P2 (этап BUY REGISTRATION FIX 2): сообщение «контроль
+        # сохранён» отправлялось безусловно, даже если _save_state_checked()
+        # вернул False, — создавалось впечатление надёжно восстановленной
+        # позиции при несохранённом state.json. Теперь при state_saved=True
+        # отправляется прежнее уведомление; при state_saved=False —
+        # отдельное критическое предупреждение (без утверждений о
+        # сохранённом контроле; новые BUY остаются заблокированы
+        # state_save_failed; ошибка сохранения не скрыта в логах).
+        if state_saved:
+            await notify(
+                f"⚠️ <b>{ticker}</b> BUY исполнен ({executed_lots} лот.), "
+                f"цена входа/SL/TP уточняются\n"
+                f"Позиция зарегистрирована как RECOVERY — контроль сохранён, "
+                f"автозакрытие отключено."
+            )
+        else:
+            await notify(
+                f"⚠️ <b>{ticker}</b> BUY исполнен ({executed_lots} лот.), "
+                f"цена входа/SL/TP уточняются\n"
+                f"⚠️ КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ: позиция RECOVERY обнаружена "
+                f"и зарегистрирована только в оперативной памяти. "
+                f"Сохранение state.json НЕ подтверждено. После перезапуска "
+                f"состояние может быть потеряно. Новые BUY заблокированы. "
+                f"Требуется проверить сохранение state.json и сверить "
+                f"позицию с брокером."
+            )
 
     if ledger is not None and order_id:
         # Дополнительный этап: подтверждение регистрации («позиция
