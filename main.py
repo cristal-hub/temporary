@@ -197,6 +197,27 @@
 #   существующей архитектурой (client.uncertain_state + UNCERTAIN-запись
 #   реестра), разрешается сверкой/оператором.
 #
+# ИЗМЕНЕНИЯ (дополнительный этап — целостность реестра и state.json):
+#   1. Архив закрытых входных заявок БЕЗ лимита (execution.py: удалён
+#      MAX_CLOSED_ENTRY_ORDER_IDS=200): FIFO-обрезка вытесняла признаки
+#      СТАРЫХ закрытых сделок — после 200 закрытий поздний residual-отчёт
+#      вытесненной заявки не блокировался guard'ом («воскрешение»).
+#      Запись архива — только короткий order_id, лимит не нужен.
+#   2. Подтверждение регистрации в реестре пишется ТОЛЬКО после успешного
+#      сохранения state.json (register_executed_buy): reason-маркер
+#      «позиция зарегистрирована»/«исполнение применено» используется
+#      startup_recovery как признак «применение уже учтено», поэтому
+#      подтверждение несохранённого состояния приводило к потере позиции
+#      при перезапуске. Ветка позднего роста: сохранение перенесено ДО
+#      записи подтверждения; при сбое сохранения пишется UNCERTAIN-запись
+#      (заявка остаётся доступной опросу, дельта применяется повторно).
+#   3. Активная RECOVERY-позиция с УЖЕ заданным entry_order_id: отчёт
+#      ДРУГОЙ заявки (несовпадение entry_order_id) явно фиксируется как
+#      UNCERTAIN (client.uncertain_state + UNCERTAIN-запись реестра);
+#      исполнение НЕ применяется, чужая заявка НЕ отмечается обработанной
+#      («позиция уже зарегистрирована — идемпотентность» не пишется).
+#      Совпадение trade_id само по себе перепривязку не выполняет.
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   resolve_closing/resolve_uncertain (execution.py — см. его шапку),
@@ -1253,6 +1274,41 @@ async def register_executed_buy(
                 )
                 _save_state_checked(monitor, rm)
                 return existing
+        elif (existing.state == PositionState.RECOVERY
+                and existing.entry_order_id and order_id
+                and str(order_id) != str(existing.entry_order_id)):
+            # Дополнительный этап: активная RECOVERY-позиция УЖЕ связана с
+            # другой входной заявкой. Раньше отчёт чужой заявки проваливался
+            # в общую ветку идемпотентности и помечался обработанным
+            # («позиция уже зарегистрирована»), хотя его исполнение к
+            # позиции НЕ применялось — реестр утверждал то, чего не было.
+            # Теперь несовпадение entry_order_id — явная неопределённость:
+            # исполнение НЕ применяется, чужая заявка НЕ отмечается
+            # обработанной (терминальный статус не пишется), фиксируется
+            # client.uncertain_state + UNCERTAIN-запись реестра; разрешается
+            # сверкой/оператором. Даже совпадение trade_id не перепривязывает
+            # заявку: позиция уже связана с другой заявкой.
+            client.uncertain_state = True
+            if ledger is not None:
+                ledger.record_uncertain(
+                    order_id, figi=figi, ticker=ticker, side="BUY",
+                    executed_lots=int(executed_lots),
+                    reason=(f"RECOVERY-позиция связана с другой входной заявкой "
+                            f"(entry_order_id={existing.entry_order_id}, trade_id="
+                            f"{existing.trade_id or '—'}): заявка {order_id} "
+                            f"(trade_id={trade_id or '—'}) чужая — исполнение "
+                            f"к позиции не применяется, требуется сверка/"
+                            f"решение оператора"),
+                    source=source or "register_executed_buy",
+                )
+            logging.error(
+                f"[register] {ticker}: заявка {order_id} НЕ совпадает с "
+                f"entry_order_id={existing.entry_order_id} активной "
+                f"RECOVERY-позиции — исполнение не применено, чужая заявка "
+                f"НЕ отмечена обработанной, UNCERTAIN"
+            )
+            _save_state_checked(monitor, rm)
+            return existing
         qty_before = existing.quantity
         applied = False
         contradiction = False
@@ -1361,6 +1417,13 @@ async def register_executed_buy(
                 and not _uncertainty_resolved_by_reconcile(rec)
             )
             if applied and not snapshot_covered_growth:
+                # Дополнительный этап: состояние сохраняется ДО записи
+                # подтверждения в реестр; подтверждение пишется ТОЛЬКО если
+                # state.json сохранён (несохранённое применение реестром
+                # не подтверждается — иначе startup_recovery при перезапуске
+                # пропускал заявку по reason-маркеру, и несохранённая дельта
+                # терялась бы безвозвратно).
+                state_saved_after_apply = _save_state_checked(monitor, rm)
                 if uncertainty_pending:
                     # Партия P0-5: исполнение применено к позиции (реально
                     # новые лоты, подтверждённые брокером), но действующая
@@ -1374,8 +1437,7 @@ async def register_executed_buy(
                         f"подтверждённой сверки портфеля — терминальный статус "
                         f"не пишется, новые BUY по {figi} остаются заблокированы"
                     )
-                    _save_state_checked(monitor, rm)
-                else:
+                elif state_saved_after_apply:
                     ledger.record_status(
                         order_id, ledger_status, executed_lots=executed_lots,
                         avg_exec_price=exec_price,
@@ -1383,7 +1445,6 @@ async def register_executed_buy(
                                f"(+{existing.quantity - qty_before} лот., итого {existing.quantity})",
                         source=source or "register_executed_buy",
                     )
-                    _save_state_checked(monitor, rm)
                     research_logger.log_event("POSITION_ENTRY_LATE_FILL", {
                         "figi": figi, "ticker": ticker, "order_id": order_id,
                         "added_lots": existing.quantity - qty_before,
@@ -1401,6 +1462,34 @@ async def register_executed_buy(
                             f"Цена входа: {existing.entry_price:.4f} (не менялась)\n"
                             f"SL: {existing.sl_price:.4f}\nTP: {existing.tp_price:.4f} — сохранены"
                         )
+                else:
+                    # Дополнительный этап: state.json НЕ сохранён —
+                    # подтверждение «исполнение применено» НЕ пишется.
+                    # Без него прежнее подтверждение регистрации маскировало
+                    # бы несохранённую дельту при перезапуске (startup_
+                    # recovery пропустил бы заявку по reason-маркеру).
+                    # Фиксируется неопределённость существующей архитектурой:
+                    # client.uncertain_state + UNCERTAIN-запись реестра —
+                    # заявка остаётся доступной опросу/сверке, дельта
+                    # применяется повторно после перезапуска.
+                    client.uncertain_state = True
+                    if ledger is not None:
+                        ledger.record_uncertain(
+                            order_id, figi=figi, ticker=ticker, side="BUY",
+                            executed_lots=int(executed_lots),
+                            reason=(f"исполнение применено к позиции в памяти "
+                                    f"(+{existing.quantity - qty_before} лот., "
+                                    f"итого {existing.quantity}), но state.json НЕ "
+                                    f"сохранён — подтверждение не пишется, "
+                                    f"требуется повторное применение/сверка"),
+                            source=source or "register_executed_buy",
+                        )
+                    logging.error(
+                        f"[register] {ticker}: state.json НЕ сохранён после "
+                        f"применения позднего исполнения заявки {order_id} "
+                        f"(+{existing.quantity - qty_before} лот.) — "
+                        f"подтверждение в реестр не пишется, UNCERTAIN"
+                    )
             elif contradiction or snapshot_covered_growth:
                 # Реестр уже переведён в UNCERTAIN выше — перезапись запрещена:
                 # противоречие/неоднозначность должны оставаться видимыми
@@ -1562,14 +1651,34 @@ async def register_executed_buy(
         )
 
     if ledger is not None and order_id:
-        ledger.record_status(
-            order_id, ledger_status, trade_id=trade_id, figi=figi, ticker=ticker,
-            side="BUY", requested_lots=requested_lots,
-            executed_lots=executed_lots, avg_exec_price=exec_price,
-            reason=("позиция зарегистрирована; RECOVERY: " + str(pos.recovery_source))
-                   if pos.state == PositionState.RECOVERY else "позиция зарегистрирована",
-            source=source or "register_executed_buy",
-        )
+        # Дополнительный этап: подтверждение регистрации («позиция
+        # зарегистрирована») пишется в реестр ТОЛЬКО после успешного
+        # сохранения state.json. Реестр и state.json должны утверждать
+        # одно и то же: если state.json не сохранён, позиция существует
+        # только в памяти и будет потеряна при перезапуске — подтверждающий
+        # reason-маркер заставил бы второй проход startup_recovery пропустить
+        # заявку («позиция зарегистрирована» = «применение уже учтено»),
+        # и подтверждённое исполнение потерялось бы. Без маркера заявка
+        # остаётся доступной доведению до регистрации при перезапуске
+        # (штатный сценарий восстановления после краха между record_sent
+        # и регистрацией). Ошибка сохранения уже зафиксирована
+        # _save_state_checked (STATE_SAVE_FAILED + блокировка новых входов).
+        if state_saved:
+            ledger.record_status(
+                order_id, ledger_status, trade_id=trade_id, figi=figi, ticker=ticker,
+                side="BUY", requested_lots=requested_lots,
+                executed_lots=executed_lots, avg_exec_price=exec_price,
+                reason=("позиция зарегистрирована; RECOVERY: " + str(pos.recovery_source))
+                       if pos.state == PositionState.RECOVERY else "позиция зарегистрирована",
+                source=source or "register_executed_buy",
+            )
+        else:
+            logging.error(
+                f"[register] {ticker}: state.json НЕ сохранён — подтверждение "
+                f"регистрации заявки {order_id} в реестр НЕ пишется "
+                f"(позиция в памяти; при перезапуске заявка будет доведена "
+                f"до регистрации повторным восстановлением)"
+            )
     return pos
 
 

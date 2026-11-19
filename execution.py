@@ -18,7 +18,12 @@
 #     - сериализуется в state.json (export_state/import_state),
 #       обратная совместимость: ключ отсутствует в старом state.json —
 #       восстанавливается пустой список;
-#     - ограничен последними MAX_CLOSED_ENTRY_ORDER_IDS записями (FIFO).
+#     - НЕ ограничен по размеру (дополнительный этап): прежний FIFO-лимит
+#       200 записей вытеснял признаки СТАРЫХ закрытых сделок — после 200
+#       закрытий поздний residual-отчёт вытесненной заявки больше не
+#       блокировался guard'ом register_executed_buy («воскрешение»
+#       закрытой позиции). Каждая запись — только короткий order_id,
+#       размер архива пренебрежим: безопасность важнее экономии байт.
 #   Торговая логика (SL/TP, закрытия, промоция) не менялась.
 import logging
 from dataclasses import dataclass, field, asdict
@@ -101,8 +106,8 @@ class TrackedPosition:
 
 
 class ExecutionMonitor:
-    # Компактный FIFO-реестр entry_order_id закрытых BUY-позиций (см. шапку).
-    MAX_CLOSED_ENTRY_ORDER_IDS = 200
+    # Компактный реестр entry_order_id закрытых BUY-позиций (см. шапку);
+    # без лимита размера — обрезка теряла признаки старых закрытых сделок.
 
     def __init__(self, client):
         self.client = client
@@ -117,8 +122,8 @@ class ExecutionMonitor:
             return
         if pos.entry_order_id not in self.closed_entry_order_ids:
             self.closed_entry_order_ids.append(pos.entry_order_id)
-            self.closed_entry_order_ids = \
-                self.closed_entry_order_ids[-self.MAX_CLOSED_ENTRY_ORDER_IDS:]
+            # Дополнительный этап: без обрезки архива — вытесненный признак
+            # закрытой сделки терял защиту guard'а от «воскрешения».
 
     def register(self, **kwargs) -> TrackedPosition:
         figi = kwargs.get("figi")
@@ -478,13 +483,13 @@ class ExecutionMonitor:
 
     def export_state(self):
         # Компактный реестр закрытых входных заявок: архив перезаписанных
-        # записей + все текущие CLOSED-записи (дедуп, FIFO-лимит).
+        # записей + все текущие CLOSED-записи (дедуп; БЕЗ лимита размера —
+        # обрезка теряла признаки старых закрытых сделок, см. шапку).
         closed_ids = list(self.closed_entry_order_ids)
         for pos in self.positions.values():
             if pos.state == PositionState.CLOSED and pos.entry_order_id:
                 if pos.entry_order_id not in closed_ids:
                     closed_ids.append(pos.entry_order_id)
-        closed_ids = closed_ids[-self.MAX_CLOSED_ENTRY_ORDER_IDS:]
         return {
             "positions": {figi: pos.to_dict() for figi, pos in self.positions.items()},
             "monitoring_error": self.monitoring_error,
@@ -498,9 +503,9 @@ class ExecutionMonitor:
         # Обратная совместимость: старый state.json без ключа -> пустой список.
         raw_closed = data.get("closed_entry_order_ids", [])
         if isinstance(raw_closed, list):
-            self.closed_entry_order_ids = [
-                str(x) for x in raw_closed if x
-            ][:self.MAX_CLOSED_ENTRY_ORDER_IDS]
+            # Дополнительный этап: полный импорт без обрезки — все признаки
+            # закрытых сделок должны переживать перезапуск.
+            self.closed_entry_order_ids = [str(x) for x in raw_closed if x]
         else:
             self.closed_entry_order_ids = []
         restored = {}

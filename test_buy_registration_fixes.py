@@ -34,6 +34,21 @@
 #                          test_s9_startup_recovery_idempotent
 #                          test_s9b_crash_after_record_sent_restored_on_startup
 #
+# Дополнительный этап (целостность реестра и state.json):
+#   A. Архив закрытых заявок БЕЗ лимита 200 (признаки старых закрытых
+#      сделок не вытесняются, переживают перезапуск, самая старая заявка
+#      по-прежнему блокирует «воскрешение»):
+#                          test_stage_archive_closed_entry_order_ids_no_200_cap
+#   B. Подтверждение регистрации в реестре ТОЛЬКО после сохранения
+#      state.json (первичная регистрация и поздний рост):
+#                          test_stage_no_registration_confirmation_when_state_save_failed
+#                          test_stage_late_fill_confirmation_only_after_save
+#   C. Несовпадение entry_order_id в активной RECOVERY — явный UNCERTAIN,
+#      чужая заявка НЕ отмечается обработанной:
+#                          test_stage_recovery_entry_order_mismatch_marks_uncertain
+#                          test_stage_recovery_entry_order_mismatch_even_if_trade_id_matches
+#                          test_stage_recovery_same_entry_order_id_still_applies_growth
+#
 # Тесты проверяют ПОСЛЕДСТВИЯ: итоговое состояние позиции (state, quantity,
 # entry_applied_lots, entry_order_id) и сохранённое состояние
 # (state.json: позиции + closed_entry_order_ids), а не только возврат
@@ -654,3 +669,278 @@ def test_state_roundtrip_closed_entry_order_ids(env):
     assert main._load_state(m3, rm)
     assert m3.closed_entry_order_ids == []
     assert m3.get_position(FIGI).entry_order_id == "oid-new"
+
+
+# ============================================================
+# Дополнительный этап A: архив закрытых заявок БЕЗ лимита 200
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_stage_archive_closed_entry_order_ids_no_200_cap(env):
+    """Архив closed_entry_order_ids НЕ обрезается лимитом 200: после 250
+    перезаписанных CLOSED-записей сохранены ВСЕ признаки, включая самые
+    старые; архив целиком переживает перезапуск (state.json roundtrip), и
+    самая старая закрытая заявка по-прежнему блокирует «воскрешение»."""
+    client = FakeClient()
+    monitor = ExecutionMonitor(client)
+    n = 250
+    for i in range(n):
+        monitor.register(figi=FIGI, ticker=TICKER, direction="BUY",
+                         entry_price=100.0 + i, quantity=1, sl_price=95.0,
+                         tp_price=110.0, lot_size=1, trade_id=f"t-arch-{i}",
+                         entry_order_id=f"oid-arch-{i}", entry_applied_lots=1)
+        monitor.get_position(FIGI).state = PositionState.CLOSED
+    assert len(monitor.closed_entry_order_ids) == n - 1
+    # следующая регистрация архивирует последнюю CLOSED-запись
+    monitor.register(figi=FIGI, ticker=TICKER, direction="BUY",
+                     entry_price=999.0, quantity=1, sl_price=95.0, tp_price=110.0,
+                     lot_size=1, trade_id="t-arch-final", entry_order_id="oid-arch-final")
+    assert len(monitor.closed_entry_order_ids) == n, "архив обрезан лимитом"
+    assert monitor.closed_entry_order_ids[0] == "oid-arch-0", \
+        "самая старая запись вытеснена из архива"
+    assert f"oid-arch-{n - 1}" in monitor.closed_entry_order_ids
+
+    # архив целиком переносится через state.json (экспорт/импорт без обрезки)
+    assert main._save_state_checked(monitor, FakeRM())
+    m2 = ExecutionMonitor(client)
+    assert main._load_state(m2, FakeRMState())
+    assert m2.closed_entry_order_ids == monitor.closed_entry_order_ids, \
+        "архив потерян/обрезан при перезапуске"
+
+    # самая старая закрытая заявка блокирует «воскрешение» после 250 закрытий
+    monitor.get_position(FIGI).state = PositionState.CLOSED
+    monitor.get_position(FIGI).quantity = 0
+    main._save_state_checked(monitor, FakeRM())
+    m3 = save_and_reload(monitor, FakeRMState())
+    ledger = make_ledger(env.tmp_path / "ledger_arch.jsonl")
+    oid_old = "oid-arch-0"
+    ledger.record_intent(oid_old, trade_id="t-arch-0", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=1)
+    ledger.record_sent(oid_old, figi=FIGI, side="BUY", requested_lots=1,
+                       executed_lots=1, status_hint="FILL")
+    client3 = FakeClient(positions={})
+    m3.client = client3
+    kw = open_kwargs(oid_old, trade_id="t-arch-0", executed=1, requested=1)
+    kw["df"] = None
+    res = await main.register_executed_buy(client3, m3, FakeRMState(), ledger, **kw)
+    assert res is None, "поздний отчёт самой старой закрытой заявки создал позицию"
+    p_after = m3.get_position(FIGI)
+    assert p_after is not None and p_after.state == PositionState.CLOSED
+    assert p_after.entry_order_id == "oid-arch-final", "CLOSED-запись перезаписана фантомом"
+
+
+# ============================================================
+# Дополнительный этап B: подтверждение регистрации только после
+# успешного сохранения state.json
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_stage_no_registration_confirmation_when_state_save_failed(env, monkeypatch):
+    """state.json НЕ сохранён: подтверждение «позиция зарегистрирована» в
+    реестр НЕ пишется (иначе startup_recovery при перезапуске пропустил бы
+    заявку по reason-маркеру, и позиция была бы потеряна). Позиция в памяти
+    не теряется; после восстановления сохранения перезапуск восстанавливает
+    её, повторная регистрация идемпотентна."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    oid = "oid-st2"
+    ledger.record_intent(oid, trade_id="t-st2", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=5)
+    ledger.record_sent(oid, figi=FIGI, side="BUY", requested_lots=5,
+                       executed_lots=5, status_hint="FILL")
+
+    real_save_state = main._save_state
+    monkeypatch.setattr(main, "_save_state", lambda m, r: False)
+
+    pos = await main.register_executed_buy(client, monitor, rm, ledger,
+                                           **open_kwargs(oid, trade_id="t-st2"))
+    # позиция создана в памяти (исполнение не потеряно), но НЕ сохранена
+    assert pos is not None and pos.state == PositionState.OPEN and pos.quantity == 5
+    assert main.state_save_failed is True
+    # подтверждение регистрации НЕ записано: latest — FILL от record_sent,
+    # ни в одной записи журнала нет маркера «позиция зарегистрирована»
+    rec = ledger.latest(oid)
+    assert rec["status"] == "FILL"
+    assert "позиция зарегистрирована" not in str(rec.get("reason") or "")
+    with open(ledger.path, "r", encoding="utf-8") as f:
+        all_recs = [json.loads(x) for x in f if x.strip()]
+    assert not any("позиция зарегистрирована" in str(r.get("reason") or "")
+                   for r in all_recs), "подтверждение записано при несохранённом state.json"
+
+    # сохранение восстановлено: перезапуск восстанавливает позицию,
+    # повторное восстановление не дублирует и не портит её
+    monkeypatch.setattr(main, "_save_state", real_save_state)
+    m2 = save_and_reload(monitor, rm)
+    p2 = m2.get_position(FIGI)
+    assert p2 is not None and p2.quantity == 5 and p2.entry_order_id == oid
+
+    client2 = FakeClient(positions={})
+    client2.order_states[oid] = fake_state(FILL, lots_executed=5, price_units=500)
+    m2.client = client2
+    await main.startup_recovery(client2, m2, rm, ledger)
+    p3 = m2.get_position(FIGI)
+    assert p3 is not None and p3.quantity == 5 and p3.entry_order_id == oid
+    assert len([p for p in m2.positions.values()
+                if p.state in (PositionState.OPEN, PositionState.RECOVERY)]) == 1, \
+        "повторное восстановление создало дубликат"
+
+
+@pytest.mark.asyncio
+async def test_stage_late_fill_confirmation_only_after_save(env, monkeypatch):
+    """Поздний рост применён к позиции в памяти, но state.json НЕ сохранён:
+    подтверждение «исполнение применено» НЕ пишется — вместо него
+    UNCERTAIN-запись (заявка остаётся доступной опросу). После перезапуска
+    state.json содержит последнюю УСПЕШНУЮ запись (5 лот.), и poll доводит
+    позицию до 8 лотов — дельта не потеряна."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    oid = "oid-stL"
+    ledger.record_intent(oid, trade_id="t-stL", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=10)
+    pos = await main.register_executed_buy(
+        client, monitor, rm, ledger,
+        **open_kwargs(oid, trade_id="t-stL", executed=5, requested=10))
+    assert pos.state == PositionState.OPEN and pos.quantity == 5
+    rec = ledger.latest(oid)
+    assert rec["status"] == "FILL" and "позиция зарегистрирована" in str(rec.get("reason"))
+
+    real_save_state = main._save_state
+    monkeypatch.setattr(main, "_save_state", lambda m, r: False)
+    client.uncertain_state = False
+    res = await main.register_executed_buy(
+        client, monitor, rm, ledger,
+        **open_kwargs(oid, trade_id="t-stL", executed=8, requested=10))
+    # дельта применена в памяти, но не подтверждена реестром
+    assert res is pos
+    assert pos.quantity == 8 and pos.entry_applied_lots == 8
+    assert client.uncertain_state is True
+    rec2 = ledger.latest(oid)
+    assert rec2["status"] == "UNCERTAIN", \
+        "подтверждение применения записано при несохранённом state.json"
+    assert "state.json НЕ сохранён" in str(rec2.get("reason") or "")
+    with open(ledger.path, "r", encoding="utf-8") as f:
+        all_recs = [json.loads(x) for x in f if x.strip()]
+    assert not any("позднее исполнение применено" in str(r.get("reason") or "")
+                   for r in all_recs), "подтверждение применения записано при несохранённом state.json"
+
+    # перезапуск: state.json — последняя УСПЕШНАЯ запись (5 лот.)
+    m2 = ExecutionMonitor(client)
+    assert main._load_state(m2, FakeRMState())
+    p2 = m2.get_position(FIGI)
+    assert p2.quantity == 5, "несохранённая дельта попала в state.json"
+
+    # UNCERTAIN-заявка доступна опросу: poll доводит позицию до 8
+    client2 = FakeClient(positions={})
+    client2.order_states[oid] = fake_state(CANCELLED, lots_executed=8, price_units=800)
+    m2.client = client2
+    monkeypatch.setattr(main, "_save_state", real_save_state)
+    await main.poll_open_orders(client2, m2, FakeRM(), ledger)
+    p3 = m2.get_position(FIGI)
+    assert p3.quantity == 8 and p3.entry_applied_lots == 8, \
+        "дельта не восстановлена после перезапуска"
+    main._save_state_checked(m2, FakeRMState())
+    raw = json.loads(open(main.STATE_FILE, "r", encoding="utf-8").read())
+    assert raw["positions"][FIGI]["quantity"] == 8, "восстановленная дельта не сохранена"
+
+
+# ============================================================
+# Дополнительный этап C: несовпадение entry_order_id в активной
+# RECOVERY-позиции — явный UNCERTAIN, чужая заявка не «обработана»
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_stage_recovery_entry_order_mismatch_marks_uncertain(env):
+    """Активная RECOVERY-позиция УЖЕ связана с заявкой B: отчёт чужой
+    заявки A (тот же FIGI, другой order_id/trade_id) НЕ отмечается
+    обработанным и НЕ применяется к позиции — явно фиксируется
+    UNCERTAIN (client.uncertain_state + запись реестра)."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos = monitor.register_recovery(figi=FIGI, ticker=TICKER, direction="BUY",
+                                    quantity=5, lot_size=1, trade_id="t-stM",
+                                    order_id="oid-stM-B", recovery_source="no_price")
+    assert pos.entry_order_id == "oid-stM-B" and pos.entry_applied_lots == 5
+
+    ledger.record_intent("oid-stM-A", trade_id="t-otherM", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=7)
+    client.uncertain_state = False
+    kw = open_kwargs("oid-stM-A", trade_id="t-otherM", executed=7, requested=7)
+    kw["df"] = None
+    res = await main.register_executed_buy(client, monitor, rm, ledger, **kw)
+    assert res is pos
+    # позиция не изменена и не перепривязана
+    assert pos.quantity == 5 and pos.entry_applied_lots == 5
+    assert pos.entry_order_id == "oid-stM-B"
+    assert pos.trade_id == "t-stM"
+    # чужая заявка явно помечена UNCERTAIN, а не «обработанной»
+    assert client.uncertain_state is True
+    rec_a = ledger.latest("oid-stM-A")
+    assert rec_a["status"] == "UNCERTAIN", "чужая заявка помечена обработанной"
+    assert "связана с другой входной заявкой" in str(rec_a.get("reason") or "")
+    with open(ledger.path, "r", encoding="utf-8") as f:
+        all_recs = [json.loads(x) for x in f if x.strip()]
+    assert not any(r.get("order_id") == "oid-stM-A"
+                   and r.get("status") in ("FILL", "CANCELLED", "REJECTED", "EXPIRED")
+                   for r in all_recs), "чужая заявка закрыта терминальным статусом"
+    # сохранённое состояние: позиция неизменна
+    assert main._save_state_checked(monitor, FakeRM())
+    raw = json.loads(open(main.STATE_FILE, "r", encoding="utf-8").read())
+    p = raw["positions"][FIGI]
+    assert p["quantity"] == 5 and p["entry_order_id"] == "oid-stM-B"
+    assert p["state"] == "RECOVERY"
+
+
+@pytest.mark.asyncio
+async def test_stage_recovery_entry_order_mismatch_even_if_trade_id_matches(env):
+    """RECOVERY-позиция уже связана с заявкой B; отчёт заявки A с ТЕМ ЖЕ
+    trade_id, что у позиции, но другим order_id: перепривязки нет,
+    исполнение не применяется, фиксируется UNCERTAIN (несовпадение
+    entry_order_id — доказательства принадлежности заявки A недостаточно)."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos = monitor.register_recovery(figi=FIGI, ticker=TICKER, direction="BUY",
+                                    quantity=5, lot_size=1, trade_id="t-stN",
+                                    order_id="oid-stN-B", recovery_source="no_price")
+    ledger.record_intent("oid-stN-A", trade_id="t-stN", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=7)
+    client.uncertain_state = False
+    kw = open_kwargs("oid-stN-A", trade_id="t-stN", executed=7, requested=7)
+    kw["df"] = None
+    res = await main.register_executed_buy(client, monitor, rm, ledger, **kw)
+    assert res is pos
+    assert client.uncertain_state is True
+    assert pos.entry_order_id == "oid-stN-B", "позиция перепривязана к чужой заявке"
+    assert pos.quantity == 5 and pos.entry_applied_lots == 5
+    assert ledger.latest("oid-stN-A")["status"] == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_stage_recovery_same_entry_order_id_still_applies_growth(env):
+    """Контроль от перегиба: отчёт СВОЕЙ заявки (entry_order_id совпадает)
+    продолжает штатно применять рост cumulative — новая проверка не
+    блокирует легитимный путь и не фиксирует ложную неопределённость."""
+    ledger = make_ledger(env.tmp_path)
+    client = FakeClient(positions={})
+    monitor = ExecutionMonitor(client)
+    rm = FakeRM()
+    pos = monitor.register_recovery(figi=FIGI, ticker=TICKER, direction="BUY",
+                                    quantity=5, lot_size=1, trade_id="t-stG",
+                                    order_id="oid-stG", recovery_source="no_price")
+    ledger.record_intent("oid-stG", trade_id="t-stG", figi=FIGI, ticker=TICKER,
+                         side="BUY", requested_lots=10)
+    client.uncertain_state = False
+    kw = open_kwargs("oid-stG", trade_id="t-stG", executed=8, requested=10)
+    kw["df"] = None
+    res = await main.register_executed_buy(client, monitor, rm, ledger, **kw)
+    assert res is pos
+    assert pos.quantity == 8 and pos.entry_applied_lots == 8, \
+        "рост своей заявки заблокирован новой проверкой"
+    assert client.uncertain_state is False, "ложная неопределённость для своей заявки"
