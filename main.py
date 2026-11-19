@@ -247,6 +247,27 @@
 #      BUY дополняются предупреждением о несохранённом состоянии.
 #      Механизм _save_state_checked() не менялся.
 #
+# ИЗМЕНЕНИЯ (этап BUY REGISTRATION FIX 3 — исполнение BUY без order_id):
+#   register_executed_buy(), ветка активной позиции: проверка
+#   принадлежности исполнения (FIX 2) выполнялась только при непустом
+#   order_id — при order_id=None/""/пробелах она пропускалась, и
+#   apply_late_entry_lots() (execution.py допускает order_id=None)
+#   применял дельту к уже существующей OPEN-позиции БЕЗ подтверждения,
+#   что исполнение относится именно к этой позиции (та же дыра у
+#   record_recovery_entry_lots() для RECOVERY-позиций). Теперь
+#   отсутствие достоверного order_id при активной позиции по тому же
+#   FIGI — явная неопределённость: client.uncertain_state=True (новые
+#   BUY запрещены до устранения), лоты НЕ применяются (quantity/
+#   entry_price/entry_applied_lots не изменяются), успешный маркер
+#   регистрации НЕ пишется; диагностическое событие с причиной
+#   отсутствия order_id пишется в research_events.jsonl (append-only).
+#   UNCERTAIN-запись реестра не пишется: record_uncertain() адресуется
+#   order_id, фиктивные идентификаторы запрещены (согласовано с веткой
+#   «исполнение без FIGI»: ledger пишется только при непустом order_id).
+#   Повторная обработка того же события идемпотентна. execution.py не
+#   менялся: безопасность гарантирована на уровне вызывающего кода
+#   (register_executed_buy), до вызова apply_late_entry_lots().
+#
 # НЕ ИЗМЕНЕНО: стратегия (MA(9/21), фильтры, calculate_sl_tp), параметры
 #   риска, Telegram-lifecycle, trading.flag логика, process_closing,
 #   resolve_closing/resolve_uncertain (execution.py — см. его шапку),
@@ -1260,6 +1281,62 @@ async def register_executed_buy(
             f"(state={existing.state.value}, order={existing.entry_order_id}) — "
             f"дубль не создаётся (order_id={order_id})"
         )
+        # Этап BUY REGISTRATION FIX 3 — исполнение БЕЗ достоверного order_id.
+        # Дефект: проверка принадлежности (FIX 2, ниже) выполнялась только
+        # при непустом order_id; при order_id=None/""/пробелах она
+        # пропускалась, и apply_late_entry_lots() (execution.py допускает
+        # order_id=None) применял дельту к существующей OPEN-позиции БЕЗ
+        # подтверждения, что исполнение относится именно к этой позиции
+        # (та же дыра у record_recovery_entry_lots() для RECOVERY-позиций).
+        # Принцип: отсутствие идентификатора — это НЕОПРЕДЕЛЁННОСТЬ, а НЕ
+        # разрешение применить исполнение. Пока order_id неизвестен,
+        # исполнение не может быть привязано ни к одной активной позиции:
+        #   - лоты НЕ применяются: quantity/entry_price/entry_applied_lots
+        #     НЕ изменяются (ни в OPEN-, ни в RECOVERY-ветках ниже);
+        #   - успешный маркер регистрации НЕ пишется (весь блок записи
+        #     реестра ниже требует непустого order_id);
+        #   - client.uncertain_state=True — новые BUY запрещены до
+        #     устранения неопределённости (trading_cycle: запрет новых
+        #     входов при uncertain_state);
+        #   - диагностическое событие с причиной отсутствия order_id — в
+        #     research_events.jsonl (append-only);
+        #   - UNCERTAIN-запись реестра НЕ пишется: record_uncertain()
+        #     адресуется order_id, фиктивные идентификаторы запрещены
+        #     (согласовано с веткой «исполнение без FIGI» выше: ledger
+        #     пишется только при непустом order_id); падение обработки
+        #     из-за невозможности записать UNCERTAIN с пустым ID исключено.
+        # Повторное получение того же события идемпотентно: позиция не
+        # изменяется, новых изменений состояния нет.
+        if not str(order_id or "").strip():
+            client.uncertain_state = True
+            research_logger.log_event("BUY_EXEC_NO_ORDER_ID", {
+                "figi": figi, "ticker": ticker, "trade_id": trade_id,
+                "order_id_raw": order_id,
+                "executed_lots": int(executed_lots),
+                "requested_lots": requested_lots,
+                "position_state": existing.state.value,
+                "entry_order_id": existing.entry_order_id,
+                "entry_applied_lots": int(existing.entry_applied_lots or 0),
+                "position_quantity": existing.quantity,
+                "source": source,
+                "note": ("исполнение BUY без достоверного order_id при активной "
+                         "позиции: лоты НЕ применены (quantity/entry_price/"
+                         "entry_applied_lots не изменены), успешный маркер "
+                         "регистрации не пишется, UNCERTAIN — новые BUY "
+                         "заблокированы до устранения неопределённости"),
+            })
+            logging.error(
+                f"[register] {ticker}: исполнение {executed_lots} лот. БЕЗ "
+                f"достоверного order_id (trade_id={trade_id or '—'}) при "
+                f"активной позиции (state={existing.state.value}, "
+                f"entry_order_id={existing.entry_order_id or '—'}, "
+                f"entry_applied_lots={int(existing.entry_applied_lots or 0)}) — "
+                f"лоты НЕ применены (quantity={existing.quantity} не изменено), "
+                f"успешный маркер не пишется, UNCERTAIN: новые BUY запрещены "
+                f"до устранения неопределённости (order_id отсутствует/пустой)"
+            )
+            _save_state_checked(monitor, rm)
+            return existing
         # Этап 5 + исправление (дефект №2 — слепая привязка RECOVERY).
         # RECOVERY-позиция без entry_order_id связывается с заявкой ТОЛЬКО
         # при подтверждённой принадлежности: оба trade_id известны и
